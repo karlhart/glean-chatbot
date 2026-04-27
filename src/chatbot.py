@@ -323,11 +323,8 @@ def _build_chat_prompt(question: str, results: list[dict]) -> str:
 
 
 def _snippets_fallback(question: str, results: list[dict]) -> str:
-    """Return a structured snippet summary when Chat API is unavailable."""
-    lines = [
-        "The Glean Chat API did not respond in time. "
-        "Here are the most relevant document excerpts found:\n"
-    ]
+    """Return a structured snippet summary when Chat API is slow."""
+    lines = ["Here are the most relevant excerpts from the Lumina knowledge base:\n"]
     for i, r in enumerate(results, start=1):
         lines.append(f"[{i}] **{r['title']}**\n{r['snippet']}\n")
     return "\n".join(lines)
