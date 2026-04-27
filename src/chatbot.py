@@ -54,6 +54,22 @@ SERVER_URL = f"https://{INSTANCE}-be.glean.com"
 DOCS_DIR = Path(__file__).parent.parent / "docs"
 INTRANET_BASE = "https://internal.example.com/policies"
 
+# Exact URLs of the documents we indexed. The interviewds datasource is shared
+# across candidates, some of whom used the same URL prefix. An exact allowlist
+# is the only reliable way to exclude other candidates' documents.
+KNOWN_URLS = {
+    f"{INTRANET_BASE}/{stem}"
+    for stem in [
+        "content-delivery-standards",
+        "employee-onboarding",
+        "international-coproduction-guidelines",
+        "it-security-policy",
+        "legal-contracts-policy",
+        "post-production-vfx-workflow",
+        "production-workflow",
+    ]
+}
+
 MAX_CONTEXT_RESULTS = 5
 MAX_CONTENT_CHARS_PER_DOC = 1500
 
@@ -104,10 +120,9 @@ def _load_full_content(url: str) -> Optional[str]:
     Implements the Glean MCP "search → read_document" pattern.
     Resolves our INTRANET_BASE URLs back to local markdown files.
     """
-    if INTRANET_BASE not in url:
+    if url not in KNOWN_URLS:
         return None
-    idx = url.index(INTRANET_BASE)
-    stem = url[idx + len(INTRANET_BASE):].lstrip("/")
+    stem = url.rsplit("/", 1)[-1]
     candidate = DOCS_DIR / f"{stem}.md"
     if candidate.exists():
         return candidate.read_text(encoding="utf-8")
@@ -191,9 +206,10 @@ def search(
         if len(results) >= page_size:
             break
         url = getattr(result, "url", "") or ""
-        # The interviewds datasource is shared across sandbox users. Post-filter
-        # by URL to ensure we only serve documents we indexed (unique INTRANET_BASE).
-        if INTRANET_BASE not in url:
+        # interviewds is shared across sandbox candidates. Some used the same
+        # URL prefix, so prefix matching alone isn't enough. Match against the
+        # exact set of URLs we indexed to exclude other candidates' documents.
+        if url not in KNOWN_URLS:
             skipped += 1
             continue
         snippets = getattr(result, "snippets", []) or []
