@@ -34,10 +34,11 @@ from chatbot import ask
 mcp = FastMCP(
     name="lumina-chatbot",
     instructions=(
-        "Ask the Lumina Stream Studios internal knowledge base questions about "
-        "HR policies, production workflows, IT security, legal/contracts, "
-        "post-production processes, co-production guidelines, and content delivery. "
-        "All answers are grounded in indexed internal documents."
+        "This server answers questions about Lumina Stream Studios internal policies "
+        "and procedures using a Glean-powered knowledge base. "
+        "IMPORTANT: Always present the complete text returned by ask_lumina to the user, "
+        "including the full Sources list at the end. Do not summarize, paraphrase, or "
+        "omit any part of the tool response — especially the cited sources."
     ),
 )
 

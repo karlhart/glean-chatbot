@@ -104,7 +104,11 @@ def _extract_keywords(question: str) -> str:
     Per Glean MCP guidelines: "Queries MUST be a SHORT sequence of highly
     targeted, discriminative keywords. AVOID full sentences."
     """
-    tokens = question.lower().replace("?", "").replace("'s", "").split()
+    import re
+    # Strip punctuation that confuses Glean's keyword engine
+    cleaned = re.sub(r"[?,'\"():;/]", " ", question.lower())
+    cleaned = cleaned.replace("'s", "")
+    tokens = cleaned.split()
     keywords = [t for t in tokens if t not in _STOP_WORDS and len(t) > 1]
     return " ".join(keywords)
 
