@@ -162,3 +162,92 @@ The `docs/` folder contains 7 fictional internal documents for Lumina Stream Stu
 - **Query specificity affects grounding**: Generic queries (e.g. "what is parental leave?") may surface results from Glean's broader index rather than the custom datasource, even with `datasourcesFilter` set. Including the company name in the query (e.g. "what is Lumina's parental leave policy?") reliably returns indexed documents. A production fix would hard-filter search to the custom datasource only, removing the fallback to the global index entirely.
 - **No conversation memory**: Each `ask_lumina` call is stateless. The Chat API supports multi-turn conversations via `chatId`, which this prototype does not implement.
 - **No permission enforcement**: All documents are indexed with `allowAllDatasourceUsersAccess: true`. Real deployments need per-document ACLs synced from the source system.
+
+---
+
+## Design Note
+
+### How the Glean APIs are used
+
+**Glean Indexing API** (`POST /api/index/v1/indexdocuments`)
+
+Authenticated with the Indexing API token. `indexer.py` reads each markdown file from `docs/`, constructs a document payload with a stable ID, title, plain-text body, view URL, and open permissions, then pushes the batch to Glean. Incremental indexing (`/indexdocuments`) is used rather than bulk replacement (`/bulkindexdocuments`) so re-running only updates changed documents without deleting the rest.
+
+Key choices:
+- `objectType: "Document"` — a generic type that works for all policy docs; in production you'd define specific types (e.g. `PolicyDocument`, `RunbookPage`) per content category.
+- `allowAllDatasourceUsersAccess: true` — sandbox shortcut. Production deployments would sync per-document ACLs from the source system (Google Drive sharing, Box permissions).
+- View URLs must match the datasource's pre-configured `urlRegex`. The sandbox datasource requires `https://internal.example.com/policies/...`.
+
+**Glean Search API** (`POST /rest/api/v1/search`)
+
+Authenticated with the Client API token via the official `glean-api-client` Python library. Before querying, the user's natural-language question is reduced to discriminative keywords (stop words removed, punctuation stripped) per Glean's MCP guideline that the search engine is keyword-based, not semantic. Results are scoped to the target datasource using `SearchRequestOptions(datasources_filter=[datasource])` and further post-filtered to an exact URL allowlist to exclude other candidates' documents in the shared sandbox.
+
+**Glean Chat API** (`POST /rest/api/v1/chat`)
+
+Also via the official client. Retrieved document snippets are injected into the Chat prompt alongside an explicit anti-hallucination instruction: *"Answer using ONLY the provided documents. If the answer is not there, say so."* The prompt follows the Glean MCP read-document pattern — Glean's search snippet (the most relevant excerpt) is always included first, with additional document context appended up to a character cap. This ensures the key passage is never lost to truncation.
+
+---
+
+### End-to-end flow
+
+```
+1. INGEST (one-time / on update)
+   docs/*.md
+     → indexer.py extracts title, body, stable ID
+     → POST /api/index/v1/indexdocuments
+     → Glean indexes async (~15–20 min propagation)
+
+2. QUERY (per ask_lumina invocation)
+   User question
+     → keyword extraction (strip stop words & punctuation)
+     → POST /rest/api/v1/search  (datasourcesFilter + URL allowlist)
+     → top-k results (title, URL, snippet)
+     → enrich with full local document content (read_document pattern)
+     → build grounded Chat prompt (snippet-first + additional context)
+     → POST /rest/api/v1/chat  (25s timeout, snippet fallback on slow response)
+     → extract answer text from response.messages[-1].fragments
+     → return: { answer, sources: [{index, title, url}] }
+
+3. MCP TOOL
+   Claude Desktop → ask_lumina(question, ...) → step 2 → answer + Sources list
+```
+
+---
+
+### Key tradeoffs
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Indexing mode | Incremental (`/indexdocuments`) | Safer for re-runs; bulk deletes all unincluded docs |
+| Search client | Official `glean-api-client` | Correct `datasourcesFilter` handling; handles auth/retries |
+| Context injection | Explicit (inject results into Chat prompt) | Scopes Chat to our datasource; prevents answers from unindexed content |
+| Datasource filter | `datasourcesFilter` + exact URL allowlist | Shared sandbox requires allowlist; prefix matching alone was not exclusive |
+| Chat timeout | 25s with snippet fallback | Sandbox Chat is slow; fallback ensures the tool always returns grounded content |
+| Auth | Global token + `X-Glean-ActAs` | Simpler for a single-service demo; user-scoped tokens are preferred in production |
+| Conversation model | Stateless (single-turn) | Scope; multi-turn via `chatId` is the obvious next step for production |
+
+---
+
+## Validation & Testing
+
+`validate.py` runs 5 end-to-end test cases against the live Glean pipeline and reports pass/fail with timing:
+
+```bash
+python validate.py
+```
+
+Each test case submits a question, checks that:
+1. A non-empty answer is returned
+2. At least one source is cited
+3. The source titles match expected Lumina document keywords
+
+All API calls emit structured log lines at INFO level, including the Glean `requestId` and `backendTimeMillis` for each Search and Chat request — useful for correlating slow responses against Glean's own telemetry.
+
+Example output:
+```
+[1/5] HR / benefits lookup
+  Q: What is Lumina Stream Studios parental leave policy?
+  ✓ PASS (14.5s)
+    Sources: Employee Onboarding Guide, IT Security & Access Control Policy
+    Answer preview: Lumina's parental leave policy provides 16 weeks fully paid...
+```
