@@ -6,7 +6,9 @@ incrementally — meaning existing documents are updated in place rather than
 deleting and re-uploading the entire datasource.
 """
 
+import logging
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -15,9 +17,29 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-INSTANCE = os.environ["GLEAN_INSTANCE"]
-INDEXING_TOKEN = os.environ["GLEAN_INDEXING_TOKEN"]
-DATASOURCE = os.environ["GLEAN_DATASOURCE"]
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Config & validation
+# ---------------------------------------------------------------------------
+
+def _require_env(key: str) -> str:
+    val = os.environ.get(key)
+    if not val:
+        raise EnvironmentError(
+            f"Required environment variable '{key}' is not set. "
+            "Copy .env.example to .env and fill in your values."
+        )
+    return val
+
+
+INSTANCE = _require_env("GLEAN_INSTANCE")
+INDEXING_TOKEN = _require_env("GLEAN_INDEXING_TOKEN")
+DATASOURCE = _require_env("GLEAN_DATASOURCE")
 
 BASE_URL = f"https://{INSTANCE}-be.glean.com/api/index/v1"
 DOCS_DIR = Path(__file__).parent.parent / "docs"
@@ -35,14 +57,40 @@ def _indexing_headers() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Retry helper
+# ---------------------------------------------------------------------------
+
+def _post_with_retry(url: str, payload: dict, timeout: int = 30) -> requests.Response:
+    """POST with exponential backoff on HTTP 429 (rate limit) responses."""
+    max_attempts = 4
+    for attempt in range(max_attempts):
+        response = requests.post(url, json=payload, headers=_indexing_headers(), timeout=timeout)
+
+        if response.status_code == 429:
+            wait = 2 ** attempt
+            logger.warning("Rate limited by Glean (429). Retrying in %ds (attempt %d/%d).", wait, attempt + 1, max_attempts)
+            time.sleep(wait)
+            continue
+
+        response.raise_for_status()
+        return response
+
+    response = requests.post(url, json=payload, headers=_indexing_headers(), timeout=timeout)
+    response.raise_for_status()
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Document loading
+# ---------------------------------------------------------------------------
+
 def load_docs() -> list[dict]:
     """Read all markdown files from the docs/ directory and return document objects."""
     documents = []
     for md_file in sorted(DOCS_DIR.glob("*.md")):
         text = md_file.read_text(encoding="utf-8")
-        # Use filename (without extension) as a stable document ID
         doc_id = f"lumina-{md_file.stem}"
-        # Extract title from the first H1 heading, fall back to filename
         title = md_file.stem.replace("-", " ").title()
         for line in text.splitlines():
             if line.startswith("# "):
@@ -69,6 +117,10 @@ def load_docs() -> list[dict]:
     return documents
 
 
+# ---------------------------------------------------------------------------
+# Indexing
+# ---------------------------------------------------------------------------
+
 def index_documents(documents: list[dict]) -> None:
     """Push documents to Glean using the incremental indexdocuments endpoint."""
     url = f"{BASE_URL}/indexdocuments"
@@ -77,16 +129,9 @@ def index_documents(documents: list[dict]) -> None:
         "documents": documents,
     }
 
-    print(f"Indexing {len(documents)} document(s) into datasource '{DATASOURCE}' ...")
-    response = requests.post(url, json=payload, headers=_indexing_headers(), timeout=30)
-
-    if response.status_code == 200:
-        print("Indexing request accepted by Glean.")
-        print("Note: documents typically become searchable within 15–20 minutes.")
-    else:
-        print(f"Indexing failed: HTTP {response.status_code}")
-        print(response.text)
-        response.raise_for_status()
+    logger.info("Indexing %d document(s) into datasource '%s' ...", len(documents), DATASOURCE)
+    _post_with_retry(url, payload, timeout=30)
+    logger.info("Indexing request accepted. Documents searchable in ~15–20 minutes.")
 
 
 def process_datasource_bulk() -> None:
@@ -94,8 +139,8 @@ def process_datasource_bulk() -> None:
     Alternative: bulk-replace the entire datasource in one upload.
 
     Use this when you want to guarantee a clean slate (e.g. on first run or
-    when removing documents).  Sends isFirstPage + isLastPage = True in one
-    request for a small document set.  For large sets, paginate with a shared
+    when removing documents). Sends isFirstPage + isLastPage = True in one
+    request for a small document set. For large sets, paginate with a shared
     uploadId.
     """
     url = f"{BASE_URL}/bulkindexdocuments"
@@ -111,21 +156,14 @@ def process_datasource_bulk() -> None:
         "forceRestartUpload": False,
     }
 
-    print(f"Bulk-indexing {len(documents)} document(s) (uploadId={upload_id}) ...")
-    response = requests.post(url, json=payload, headers=_indexing_headers(), timeout=30)
-
-    if response.status_code == 200:
-        print("Bulk indexing request accepted.")
-    else:
-        print(f"Bulk indexing failed: HTTP {response.status_code}")
-        print(response.text)
-        response.raise_for_status()
+    logger.info("Bulk-indexing %d document(s) (uploadId=%s) ...", len(documents), upload_id)
+    _post_with_retry(url, payload, timeout=30)
+    logger.info("Bulk indexing request accepted.")
 
 
 if __name__ == "__main__":
     docs = load_docs()
-    print(f"Found {len(docs)} document(s) in {DOCS_DIR}:")
+    logger.info("Found %d document(s) in %s:", len(docs), DOCS_DIR)
     for d in docs:
-        print(f"  [{d['id']}] {d['title']}  ({len(d['body']['textContent'])} chars)")
-    print()
+        logger.info("  [%s] %s  (%d chars)", d["id"], d["title"], len(d["body"]["textContent"]))
     index_documents(docs)

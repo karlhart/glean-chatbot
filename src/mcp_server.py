@@ -17,6 +17,16 @@ from mcp.server.fastmcp import FastMCP
 # Load .env from the project root (one level above src/)
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
+# Validate required env vars at startup so the MCP server fails fast with a
+# clear message rather than crashing mid-request with a cryptic KeyError.
+_REQUIRED = ["GLEAN_INSTANCE", "GLEAN_CLIENT_TOKEN", "GLEAN_DATASOURCE"]
+_missing = [k for k in _REQUIRED if not os.environ.get(k)]
+if _missing:
+    raise EnvironmentError(
+        f"Missing required environment variable(s): {', '.join(_missing)}. "
+        "Copy .env.example to .env and fill in your values."
+    )
+
 from chatbot import ask
 
 mcp = FastMCP(
