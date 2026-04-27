@@ -57,6 +57,13 @@ DOCS_DIR = Path(__file__).parent.parent / "docs"
 # Glean MCP guidelines recommend 3–5 results passed to Chat for focused context.
 MAX_CONTEXT_RESULTS = 5
 
+# Max characters of document content included per source in the Chat prompt.
+# Full documents average ~5KB; passing all 5 untruncated pushes Chat API
+# response times to 30-40s which exceeds Claude Desktop's MCP call timeout.
+# 1500 chars captures the most relevant section while keeping total prompt
+# size under ~10KB and Chat responses under ~15s.
+MAX_CONTENT_CHARS_PER_DOC = 1500
+
 # URL prefix used when indexing local docs — maps back to the docs/ directory.
 INTRANET_BASE = "https://internal.example.com/policies"
 
@@ -156,15 +163,32 @@ def _enrich_with_full_content(results: list[dict]) -> list[dict]:
     """
     Replace snippet text with full document content where available.
 
-    Implements the Glean MCP read_document best practice. Keeps snippet as
-    fallback when the full file cannot be resolved (e.g. external URLs).
+    Implements the Glean MCP read_document best practice. Content is capped at
+    MAX_CONTENT_CHARS_PER_DOC to keep the Chat prompt size manageable and
+    avoid MCP call timeouts caused by slow Chat API responses on large prompts.
+    Falls back to snippet when the full file cannot be resolved.
     """
     enriched = []
     for r in results:
         full_text = _load_full_content(r["url"])
+        if full_text:
+            # Always lead with the snippet (Glean's most-relevant excerpt),
+            # then append additional document context up to the char cap.
+            # This preserves relevance even when truncation cuts the key section.
+            snippet = r["snippet"]
+            remaining = MAX_CONTENT_CHARS_PER_DOC - len(snippet)
+            if remaining > 200:
+                extra = full_text[:remaining]
+                content = f"{snippet}\n\n[Additional context:]\n{extra}"
+                if len(full_text) > remaining:
+                    content += "\n[... document truncated ...]"
+            else:
+                content = snippet
+        else:
+            content = r["snippet"]
         enriched.append({
             **r,
-            "content": full_text if full_text else r["snippet"],
+            "content": content,
             "has_full_content": full_text is not None,
         })
     logger.info("Enriched %d/%d results with full document content.",
