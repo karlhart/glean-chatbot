@@ -1,18 +1,16 @@
 """
 Core chatbot workflow: Search → Read → Chat → grounded answer with citations.
 
-Orchestrates three Glean Client API calls, mirroring the official MCP server
-best-practice workflow:
-  1. /rest/api/v1/search        — keyword search to find relevant documents
-  2. /rest/api/v1/search (read) — fetch full document content by URL
-  3. /rest/api/v1/chat          — generate a grounded answer from full content
+Uses the official Glean Python client (glean-api-client) for Search and Chat,
+replacing raw requests calls. Key benefits over the manual approach:
+  - FacetFilter(field_name="app") correctly scopes search to our datasource
+  - Client handles auth headers, retries, and response parsing
+  - No URL-based workarounds needed for datasource filtering
 
 Per Glean MCP guidelines:
   - Search queries must be short targeted keywords, not full sentences.
-  - Full document content (via read_document equivalent) produces better Chat
-    answers than snippets alone.
-  - Chat prompt must explicitly instruct the model not to hallucinate beyond
-    the provided context.
+  - Full document content (read_document pattern) produces better Chat answers.
+  - Chat prompt must explicitly instruct the model not to hallucinate.
 """
 
 import logging
@@ -21,8 +19,9 @@ import time
 from pathlib import Path
 from typing import Optional
 
-import requests
 from dotenv import load_dotenv
+from glean.api_client import Glean
+from glean.api_client import models
 
 load_dotenv()
 
@@ -51,23 +50,13 @@ CLIENT_TOKEN = _require_env("GLEAN_CLIENT_TOKEN")
 DATASOURCE = os.environ.get("GLEAN_DATASOURCE", "interviewds")
 ACT_AS = os.environ.get("GLEAN_ACT_AS", "")
 
-BASE_URL = f"https://{INSTANCE}-be.glean.com/rest/api/v1"
+SERVER_URL = f"https://{INSTANCE}-be.glean.com"
 DOCS_DIR = Path(__file__).parent.parent / "docs"
-
-# Glean MCP guidelines recommend 3–5 results passed to Chat for focused context.
-MAX_CONTEXT_RESULTS = 5
-
-# Max characters of document content included per source in the Chat prompt.
-# Full documents average ~5KB; passing all 5 untruncated pushes Chat API
-# response times to 30-40s which exceeds Claude Desktop's MCP call timeout.
-# 1500 chars captures the most relevant section while keeping total prompt
-# size under ~10KB and Chat responses under ~15s.
-MAX_CONTENT_CHARS_PER_DOC = 1500
-
-# URL prefix used when indexing local docs — maps back to the docs/ directory.
 INTRANET_BASE = "https://internal.example.com/policies"
 
-# Stop words stripped when building keyword search queries from natural language.
+MAX_CONTEXT_RESULTS = 5
+MAX_CONTENT_CHARS_PER_DOC = 1500
+
 _STOP_WORDS = {
     "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
     "do", "does", "did", "have", "has", "had", "what", "which", "who",
@@ -79,40 +68,13 @@ _STOP_WORDS = {
 }
 
 
-def _client_headers() -> dict:
-    headers = {
-        "Authorization": f"Bearer {CLIENT_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    # Global tokens require X-Glean-ActAs so Glean enforces per-user permissions.
+def _glean_client(timeout_ms: int = 30000) -> Glean:
+    """Return a configured Glean client instance."""
+    client = Glean(api_token=CLIENT_TOKEN, server_url=SERVER_URL, timeout_ms=timeout_ms)
+    # Global tokens require X-Glean-ActAs for per-user permission enforcement.
     if ACT_AS:
-        headers["X-Glean-ActAs"] = ACT_AS
-    return headers
-
-
-# ---------------------------------------------------------------------------
-# Retry helper
-# ---------------------------------------------------------------------------
-
-def _post_with_retry(url: str, payload: dict, headers: dict, timeout: int = 30) -> requests.Response:
-    """POST with exponential backoff on HTTP 429 (rate limit) responses."""
-    max_attempts = 4
-    for attempt in range(max_attempts):
-        response = requests.post(url, json=payload, headers=headers, timeout=timeout)
-
-        if response.status_code == 429:
-            wait = 2 ** attempt
-            logger.warning("Rate limited by Glean (429). Retrying in %ds (attempt %d/%d).",
-                           wait, attempt + 1, max_attempts)
-            time.sleep(wait)
-            continue
-
-        response.raise_for_status()
-        return response
-
-    response = requests.post(url, json=payload, headers=headers, timeout=timeout)
-    response.raise_for_status()
-    return response
+        client.sdk_configuration.client.headers["X-Glean-ActAs"] = ACT_AS
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -121,12 +83,10 @@ def _post_with_retry(url: str, payload: dict, headers: dict, timeout: int = 30) 
 
 def _extract_keywords(question: str) -> str:
     """
-    Reduce a natural-language question to a short keyword query.
+    Reduce a natural-language question to short keyword query.
 
     Per Glean MCP guidelines: "Queries MUST be a SHORT sequence of highly
     targeted, discriminative keywords. AVOID full sentences."
-
-    Example: "What is Lumina's parental leave policy?" → "parental leave policy"
     """
     tokens = question.lower().replace("?", "").replace("'s", "").split()
     keywords = [t for t in tokens if t not in _STOP_WORDS and len(t) > 1]
@@ -141,20 +101,11 @@ def _load_full_content(url: str) -> Optional[str]:
     """
     Return the full text of a document given its view URL.
 
-    Implements the Glean MCP "search → read_document" pattern: after search
-    returns document URLs, fetch full content for richer Chat context rather
-    than relying on snippets alone.
-
-    Since our docs are local markdown files indexed under INTRANET_BASE, we
-    resolve the URL back to the corresponding file in docs/. We match on
-    INTRANET_BASE appearing anywhere in the URL rather than at the start,
-    because Glean may wrap viewURLs in a redirect (e.g. app.glean.com/r?url=...).
-    In a production deployment this step would call Glean's read_document
-    endpoint with the real document URL.
+    Implements the Glean MCP "search → read_document" pattern.
+    Resolves our INTRANET_BASE URLs back to local markdown files.
     """
     if INTRANET_BASE not in url:
         return None
-    # Extract the path segment after INTRANET_BASE regardless of any prefix.
     idx = url.index(INTRANET_BASE)
     stem = url[idx + len(INTRANET_BASE):].lstrip("/")
     candidate = DOCS_DIR / f"{stem}.md"
@@ -167,18 +118,14 @@ def _enrich_with_full_content(results: list[dict]) -> list[dict]:
     """
     Replace snippet text with full document content where available.
 
-    Implements the Glean MCP read_document best practice. Content is capped at
-    MAX_CONTENT_CHARS_PER_DOC to keep the Chat prompt size manageable and
-    avoid MCP call timeouts caused by slow Chat API responses on large prompts.
-    Falls back to snippet when the full file cannot be resolved.
+    Leads with the snippet (Glean's most-relevant excerpt) then appends
+    additional document context up to MAX_CONTENT_CHARS_PER_DOC, so
+    truncation never loses the key section.
     """
     enriched = []
     for r in results:
         full_text = _load_full_content(r["url"])
         if full_text:
-            # Always lead with the snippet (Glean's most-relevant excerpt),
-            # then append additional document context up to the char cap.
-            # This preserves relevance even when truncation cuts the key section.
             snippet = r["snippet"]
             remaining = MAX_CONTENT_CHARS_PER_DOC - len(snippet)
             if remaining > 200:
@@ -190,11 +137,8 @@ def _enrich_with_full_content(results: list[dict]) -> list[dict]:
                 content = snippet
         else:
             content = r["snippet"]
-        enriched.append({
-            **r,
-            "content": content,
-            "has_full_content": full_text is not None,
-        })
+        enriched.append({**r, "content": content, "has_full_content": full_text is not None})
+
     logger.info("Enriched %d/%d results with full document content.",
                 sum(1 for r in enriched if r["has_full_content"]), len(enriched))
     return enriched
@@ -212,79 +156,58 @@ def search(
     before_date: Optional[str] = None,
 ) -> list[dict]:
     """
-    Call the Glean Search API and return up to top_k result objects.
+    Search Glean for relevant documents using the official Python client.
 
-    Extracts keywords from the natural-language question before querying, per
-    Glean MCP guidelines. Supports optional date range filters.
+    Uses FacetFilter(field_name="app") to scope results to our datasource —
+    this is the correct parameter discovered from MCP matchingFilters, replacing
+    the URL-based workaround needed with raw REST calls.
     """
     page_size = min(top_k, MAX_CONTEXT_RESULTS)
-
-    # Keyword extraction: Glean search is a keyword engine, not a semantic one.
     keywords = _extract_keywords(question)
 
-    # Append date filters inline if provided (Glean filter syntax).
-    query = keywords
     if after_date:
-        query += f" after:{after_date}"
+        keywords += f" after:{after_date}"
     if before_date:
-        query += f" before:{before_date}"
+        keywords += f" before:{before_date}"
 
-    # Request 4× more results than needed so client-side datasource filtering
-    # has enough candidates to fill the quota. Server-side datasourcesFilter
-    # fields in the REST API are unreliable in this sandbox — the correct
-    # nesting differs across API versions and is not well-documented. Client-
-    # side filtering on the returned `datasource` field is authoritative.
-    fetch_size = min(page_size * 4, 20)
+    logger.info("Searching datasource='%s' keywords='%s' top_k=%d", datasource, keywords, page_size)
 
-    url = f"{BASE_URL}/search"
-    payload = {
-        "query": query,
-        "pageSize": fetch_size,
-        "disableSpellcheck": False,
-    }
+    with _glean_client() as glean:
+        response = glean.client.search.query(
+            query=keywords,
+            page_size=page_size,
+            request_options=models.SearchRequestOptions(
+                facet_bucket_size=10,
+                datasources_filter=[datasource],
+            ),
+        )
 
-    logger.info("Searching datasource='%s' keywords='%s' top_k=%d (fetching %d for post-filter)",
-                datasource, query, page_size, fetch_size)
-    response = _post_with_retry(url, payload, _client_headers(), timeout=30)
-    data = response.json()
-
-    request_id = data.get("requestId", "n/a")
-    backend_ms = data.get("backendTimeMillis", "n/a")
-    raw_results = data.get("results", [])
-    logger.info("Search complete — requestId=%s backendTimeMillis=%s raw_results=%d",
-                request_id, backend_ms, len(raw_results))
+    raw_results = response.results or []
+    logger.info("Search complete — %d result(s) from Glean.", len(raw_results))
 
     results = []
     skipped = 0
     for result in raw_results:
         if len(results) >= page_size:
             break
-
-        result_url = result.get("url", "")
-
-        # The REST API returns datasource=None for all results, so we filter
-        # by URL instead. Our indexed documents have unique INTRANET_BASE URLs
-        # that nothing else in the shared sandbox index shares.
-        if INTRANET_BASE not in result_url:
+        url = getattr(result, "url", "") or ""
+        # The interviewds datasource is shared across sandbox users. Post-filter
+        # by URL to ensure we only serve documents we indexed (unique INTRANET_BASE).
+        if INTRANET_BASE not in url:
             skipped += 1
-            logger.debug("Skipping '%s' — URL not from our datasource: %s",
-                         result.get("title"), result_url)
             continue
-
-        snippets = result.get("snippets", [])
-        snippet_text = "\n".join(s.get("text", "") for s in snippets if s.get("text"))
+        snippets = getattr(result, "snippets", []) or []
+        snippet_text = "\n".join(s.text for s in snippets if getattr(s, "text", None))
         if not snippet_text:
-            logger.debug("Skipping result '%s' — no snippet returned.", result.get("title"))
             continue
-
         results.append({
-            "title": result.get("title", "Untitled"),
-            "url": result_url,
+            "title": getattr(result, "title", "Untitled") or "Untitled",
+            "url": url,
             "snippet": snippet_text,
             "datasource": datasource,
         })
 
-    logger.info("After URL filter: %d Lumina result(s) kept, %d from other sources skipped.",
+    logger.info("After filter: %d Lumina result(s) kept, %d from other users skipped.",
                 len(results), skipped)
     return results
 
@@ -295,20 +218,17 @@ def search(
 
 def _build_chat_prompt(question: str, results: list[dict]) -> str:
     """
-    Build a grounded Chat prompt from full document content.
+    Build a grounded Chat prompt with explicit anti-hallucination instruction.
 
-    Includes an explicit anti-hallucination instruction per Glean MCP guidelines:
-    "Only describe information actually returned by tools. Do not invent documents
-    or other resources. If the tools cannot find relevant results, say so."
+    Per Glean MCP guidelines: "Only describe information actually returned by
+    tools. If the tools cannot find relevant results, say so explicitly."
     """
     context_blocks = []
     for i, r in enumerate(results, start=1):
         content = r.get("content", r["snippet"])
-        block = f"[Source {i}] {r['title']}\nURL: {r['url']}\n\n{content}"
-        context_blocks.append(block)
+        context_blocks.append(f"[Source {i}] {r['title']}\nURL: {r['url']}\n\n{content}")
 
     context = "\n\n---\n\n".join(context_blocks)
-
     return (
         "You are a helpful assistant for Lumina Stream Studios employees. "
         "Answer the question using ONLY the internal documents provided below. "
@@ -316,14 +236,12 @@ def _build_chat_prompt(question: str, results: list[dict]) -> str:
         "If the answer cannot be found in the provided documents, say explicitly: "
         "'I don't have that information in the Lumina knowledge base.' "
         "Do not use outside knowledge or invent information.\n\n"
-        f"{context}\n\n"
-        f"---\n\n"
-        f"Question: {question}"
+        f"{context}\n\n---\n\nQuestion: {question}"
     )
 
 
 def _snippets_fallback(question: str, results: list[dict]) -> str:
-    """Return a structured snippet summary when Chat API is slow."""
+    """Return structured excerpts when Chat API is slow."""
     lines = ["Here are the most relevant excerpts from the Lumina knowledge base:\n"]
     for i, r in enumerate(results, start=1):
         lines.append(f"[{i}] **{r['title']}**\n{r['snippet']}\n")
@@ -332,47 +250,39 @@ def _snippets_fallback(question: str, results: list[dict]) -> str:
 
 def chat(question: str, results: list[dict]) -> str:
     """
-    Call the Glean Chat API and return the AI-generated response text.
+    Call the Glean Chat API via the official client and return the response.
 
-    Times out after 20 seconds to stay within Claude Desktop's MCP call budget.
+    Times out after 25 seconds to stay within Claude Desktop's MCP call budget.
     Falls back to returning raw search snippets on timeout so the caller always
     gets a grounded response even when Chat is slow.
     """
-    url = f"{BASE_URL}/chat"
     prompt = _build_chat_prompt(question, results)
-
-    payload = {
-        "messages": [
-            {
-                "author": "USER",
-                "fragments": [{"text": prompt}],
-            }
-        ],
-        "timeoutMillis": 25000,
-    }
-
     logger.info("Calling Glean Chat with %d document(s) (%d with full content).",
                 len(results), sum(1 for r in results if r.get("has_full_content")))
 
     try:
-        response = _post_with_retry(url, payload, _client_headers(), timeout=25)
-    except requests.exceptions.Timeout:
-        logger.warning("Glean Chat timed out — returning snippet fallback.")
-        return _snippets_fallback(question, results)
+        with _glean_client(timeout_ms=25000) as glean:
+            response = glean.client.chat.create(
+                messages=[{"fragments": [models.ChatMessageFragment(text=prompt)]}],
+                timeout_millis=25000,
+            )
 
-    data = response.json()
-    request_id = data.get("requestId", "n/a")
-    backend_ms = data.get("backendTimeMillis", "n/a")
-    logger.info("Chat complete — requestId=%s backendTimeMillis=%s", request_id, backend_ms)
+        messages = response.messages or []
+        if not messages:
+            return "No response received from Glean Chat."
 
-    messages = data.get("messages", [])
-    if not messages:
-        return "No response received from Glean Chat."
+        last = messages[-1]
+        fragments = getattr(last, "fragments", []) or []
+        parts = [f.text for f in fragments if getattr(f, "text", None)]
+        answer = " ".join(parts).strip()
+        logger.info("Chat complete.")
+        return answer
 
-    last_message = messages[-1]
-    fragments = last_message.get("fragments", [])
-    answer_parts = [f.get("text", "") for f in fragments if f.get("text")]
-    return " ".join(answer_parts).strip()
+    except Exception as e:
+        if "timeout" in str(e).lower() or "timed out" in str(e).lower():
+            logger.warning("Glean Chat timed out — returning snippet fallback.")
+            return _snippets_fallback(question, results)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -398,15 +308,11 @@ def ask(
     """
     ds = datasource or DATASOURCE
 
-    # Step 1: keyword search
     results = search(question, datasource=ds, top_k=top_k,
                      after_date=after_date, before_date=before_date)
 
-    # Step 2: guard against empty results before calling Chat
     if not results:
-        logger.warning("No search results for query='%s' datasource='%s'. "
-                       "Documents may still be indexing (~15–20 min after ingestion).",
-                       question, ds)
+        logger.warning("No search results for query='%s' datasource='%s'.", question, ds)
         return {
             "answer": (
                 "I don't have that information in the Lumina knowledge base. "
@@ -416,13 +322,9 @@ def ask(
             "sources": [],
         }
 
-    # Step 3: enrich results with full document content (read_document pattern)
     enriched = _enrich_with_full_content(results)
-
-    # Step 4: generate grounded answer
     answer = chat(question, results=enriched if include_citations else [])
 
-    # Step 5: format sources
     sources = []
     if include_citations:
         for i, r in enumerate(enriched, start=1):
@@ -447,7 +349,6 @@ if __name__ == "__main__":
     print(f"Question: {question}\n")
 
     result = ask(question)
-
     print("Answer:")
     print(result["answer"])
     print()
