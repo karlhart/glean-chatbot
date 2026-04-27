@@ -27,6 +27,8 @@ if _missing:
         "Copy .env.example to .env and fill in your values."
     )
 
+from typing import Optional
+
 from chatbot import ask
 
 mcp = FastMCP(
@@ -46,20 +48,24 @@ def ask_lumina(
     datasource: str = "interviewds",
     top_k: int = 5,
     include_citations: bool = True,
+    after_date: Optional[str] = None,
+    before_date: Optional[str] = None,
 ) -> str:
     """
     Ask the Lumina Stream Studios internal chatbot a natural-language question.
 
-    Internally this tool:
-      1. Searches the Glean index for relevant internal documents (Search API).
-      2. Sends those documents as context to Glean Chat to generate a grounded answer.
-      3. Returns the answer together with the source documents used.
+    Internally this tool runs the full Glean pipeline:
+      1. Extracts keywords from the question and searches the Glean index.
+      2. Enriches results with full document content (read_document pattern).
+      3. Sends context to Glean Chat to generate a grounded, cited answer.
 
     Args:
         question:          The natural-language question to answer (required).
-        datasource:        Glean datasource name to search within (default: interviewds).
-        top_k:             Maximum number of search results to retrieve (default: 5).
+        datasource:        Glean datasource to search within (default: interviewds).
+        top_k:             Number of search results to retrieve, max 5 (default: 5).
         include_citations: Whether to append source references to the answer (default: True).
+        after_date:        Only include documents updated after this date (YYYY-MM-DD).
+        before_date:       Only include documents updated before this date (YYYY-MM-DD).
 
     Returns:
         A formatted string containing the grounded answer and, if include_citations
@@ -70,6 +76,8 @@ def ask_lumina(
         datasource=datasource,
         top_k=top_k,
         include_citations=include_citations,
+        after_date=after_date,
+        before_date=before_date,
     )
 
     response_parts = [result["answer"]]
