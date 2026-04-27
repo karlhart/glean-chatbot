@@ -146,13 +146,17 @@ def _load_full_content(url: str) -> Optional[str]:
     than relying on snippets alone.
 
     Since our docs are local markdown files indexed under INTRANET_BASE, we
-    resolve the URL back to the corresponding file in docs/.  In a production
-    deployment this step would call Glean's read_document endpoint with the
-    real document URL.
+    resolve the URL back to the corresponding file in docs/. We match on
+    INTRANET_BASE appearing anywhere in the URL rather than at the start,
+    because Glean may wrap viewURLs in a redirect (e.g. app.glean.com/r?url=...).
+    In a production deployment this step would call Glean's read_document
+    endpoint with the real document URL.
     """
-    if not url.startswith(INTRANET_BASE):
+    if INTRANET_BASE not in url:
         return None
-    stem = url[len(INTRANET_BASE):].lstrip("/")
+    # Extract the path segment after INTRANET_BASE regardless of any prefix.
+    idx = url.index(INTRANET_BASE)
+    stem = url[idx + len(INTRANET_BASE):].lstrip("/")
     candidate = DOCS_DIR / f"{stem}.md"
     if candidate.exists():
         return candidate.read_text(encoding="utf-8")
@@ -296,8 +300,25 @@ def _build_chat_prompt(question: str, results: list[dict]) -> str:
     )
 
 
+def _snippets_fallback(question: str, results: list[dict]) -> str:
+    """Return a structured snippet summary when Chat API is unavailable."""
+    lines = [
+        "The Glean Chat API did not respond in time. "
+        "Here are the most relevant document excerpts found:\n"
+    ]
+    for i, r in enumerate(results, start=1):
+        lines.append(f"[{i}] **{r['title']}**\n{r['snippet']}\n")
+    return "\n".join(lines)
+
+
 def chat(question: str, results: list[dict]) -> str:
-    """Call the Glean Chat API and return the AI-generated response text."""
+    """
+    Call the Glean Chat API and return the AI-generated response text.
+
+    Times out after 20 seconds to stay within Claude Desktop's MCP call budget.
+    Falls back to returning raw search snippets on timeout so the caller always
+    gets a grounded response even when Chat is slow.
+    """
     url = f"{BASE_URL}/chat"
     prompt = _build_chat_prompt(question, results)
 
@@ -308,14 +329,19 @@ def chat(question: str, results: list[dict]) -> str:
                 "fragments": [{"text": prompt}],
             }
         ],
-        "timeoutMillis": 30000,
+        "timeoutMillis": 25000,
     }
 
     logger.info("Calling Glean Chat with %d document(s) (%d with full content).",
                 len(results), sum(1 for r in results if r.get("has_full_content")))
-    response = _post_with_retry(url, payload, _client_headers(), timeout=45)
-    data = response.json()
 
+    try:
+        response = _post_with_retry(url, payload, _client_headers(), timeout=25)
+    except requests.exceptions.Timeout:
+        logger.warning("Glean Chat timed out — returning snippet fallback.")
+        return _snippets_fallback(question, results)
+
+    data = response.json()
     request_id = data.get("requestId", "n/a")
     backend_ms = data.get("backendTimeMillis", "n/a")
     logger.info("Chat complete — requestId=%s backendTimeMillis=%s", request_id, backend_ms)
