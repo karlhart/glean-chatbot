@@ -229,41 +229,63 @@ def search(
     if before_date:
         query += f" before:{before_date}"
 
+    # Request 4× more results than needed so client-side datasource filtering
+    # has enough candidates to fill the quota. Server-side datasourcesFilter
+    # fields in the REST API are unreliable in this sandbox — the correct
+    # nesting differs across API versions and is not well-documented. Client-
+    # side filtering on the returned `datasource` field is authoritative.
+    fetch_size = min(page_size * 4, 20)
+
     url = f"{BASE_URL}/search"
     payload = {
         "query": query,
-        "pageSize": page_size,
-        "datasourcesFilter": [datasource],
+        "pageSize": fetch_size,
         "disableSpellcheck": False,
     }
 
-    logger.info("Searching datasource='%s' keywords='%s' top_k=%d", datasource, query, page_size)
+    logger.info("Searching datasource='%s' keywords='%s' top_k=%d (fetching %d for post-filter)",
+                datasource, query, page_size, fetch_size)
     response = _post_with_retry(url, payload, _client_headers(), timeout=30)
     data = response.json()
 
     request_id = data.get("requestId", "n/a")
     backend_ms = data.get("backendTimeMillis", "n/a")
     raw_results = data.get("results", [])
-    logger.info("Search complete — requestId=%s backendTimeMillis=%s results=%d",
+    logger.info("Search complete — requestId=%s backendTimeMillis=%s raw_results=%d",
                 request_id, backend_ms, len(raw_results))
 
     results = []
+    skipped = 0
     for result in raw_results:
+        if len(results) >= page_size:
+            break
+
+        result_url = result.get("url", "")
+
+        # The REST API returns datasource=None for all results, so we filter
+        # by URL instead. Our indexed documents have unique INTRANET_BASE URLs
+        # that nothing else in the shared sandbox index shares.
+        if INTRANET_BASE not in result_url:
+            skipped += 1
+            logger.debug("Skipping '%s' — URL not from our datasource: %s",
+                         result.get("title"), result_url)
+            continue
+
         snippets = result.get("snippets", [])
         snippet_text = "\n".join(s.get("text", "") for s in snippets if s.get("text"))
-        # Per Glean MCP guidelines: prefer a small number of highly relevant
-        # sources. Skip results with no snippet — they matched on metadata only
-        # and won't contribute useful context to Chat.
         if not snippet_text:
             logger.debug("Skipping result '%s' — no snippet returned.", result.get("title"))
             continue
+
         results.append({
             "title": result.get("title", "Untitled"),
-            "url": result.get("url", ""),
+            "url": result_url,
             "snippet": snippet_text,
-            "datasource": result.get("datasource", datasource),
+            "datasource": datasource,
         })
 
+    logger.info("After URL filter: %d Lumina result(s) kept, %d from other sources skipped.",
+                len(results), skipped)
     return results
 
 
