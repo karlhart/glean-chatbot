@@ -329,13 +329,20 @@ def ask(
     include_citations: bool = True,
     after_date: Optional[str] = None,
     before_date: Optional[str] = None,
+    fast_mode: bool = False,
 ) -> dict:
     """
     Full pipeline: search → enrich with full content → chat → grounded answer.
 
+    fast_mode=True skips the Glean Chat API entirely and returns the raw search
+    excerpts. Responses come back in ~500ms instead of 10–20s. Useful when the
+    user needs a quick lookup rather than a synthesised answer. The Glean Chat
+    API accounts for ~95% of total latency in the sandbox; fast_mode eliminates
+    that cost at the expense of a less polished, non-synthesised response.
+
     Returns:
         {
-            "answer":  str,           # Grounded response from Glean Chat
+            "answer":  str,           # Grounded response (Chat or snippets)
             "sources": list[dict],    # Source documents used as context
         }
     """
@@ -356,7 +363,12 @@ def ask(
         }
 
     enriched = _enrich_with_full_content(results)
-    answer = chat(question, results=enriched if include_citations else [])
+
+    if fast_mode:
+        logger.info("fast_mode=True — skipping Chat API, returning search excerpts.")
+        answer = _snippets_fallback(question, enriched)
+    else:
+        answer = chat(question, results=enriched if include_citations else [])
 
     sources = []
     if include_citations:

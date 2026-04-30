@@ -51,6 +51,7 @@ def ask_lumina(
     include_citations: bool = True,
     after_date: Optional[str] = None,
     before_date: Optional[str] = None,
+    fast_mode: bool = False,
 ) -> str:
     """
     Ask the Lumina Stream Studios internal chatbot a natural-language question.
@@ -67,6 +68,9 @@ def ask_lumina(
         include_citations: Whether to append source references to the answer (default: True).
         after_date:        Only include documents updated after this date (YYYY-MM-DD).
         before_date:       Only include documents updated before this date (YYYY-MM-DD).
+        fast_mode:         Skip Glean Chat and return search excerpts directly (~500ms
+                           instead of 10-20s). Use when speed matters more than a
+                           synthesised answer (default: False).
 
     Returns:
         A formatted string containing the grounded answer and, if include_citations
@@ -79,6 +83,7 @@ def ask_lumina(
         include_citations=include_citations,
         after_date=after_date,
         before_date=before_date,
+        fast_mode=fast_mode,
     )
 
     response_parts = [result["answer"]]
