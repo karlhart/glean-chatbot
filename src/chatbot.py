@@ -71,9 +71,10 @@ KNOWN_URLS = {
 }
 
 MAX_CONTEXT_RESULTS = 5
-MAX_CONTENT_CHARS_PER_DOC = 1500
+MAX_CONTENT_CHARS_PER_DOC = 2500
 
 _STOP_WORDS = {
+    # Articles, pronouns, prepositions
     "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
     "do", "does", "did", "have", "has", "had", "what", "which", "who",
     "where", "when", "why", "how", "i", "me", "my", "we", "our", "you",
@@ -81,6 +82,11 @@ _STOP_WORDS = {
     "for", "and", "or", "but", "not", "with", "about", "from", "by",
     "can", "could", "would", "should", "will", "tell", "find", "give",
     "get", "use", "need", "want", "know", "show",
+    # Task-instruction verbs — describe what to DO with content, not what to FIND.
+    # Passing these to the keyword search engine returns unrelated documents.
+    "summarize", "summary", "explain", "description", "describe", "list",
+    "detail", "details", "outline", "provide", "give", "please", "help",
+    "overview", "walkthrough", "breakdown",
 }
 
 
@@ -189,12 +195,19 @@ def search(
     if before_date:
         keywords += f" before:{before_date}"
 
-    logger.info("Searching datasource='%s' keywords='%s' top_k=%d", datasource, keywords, page_size)
+    # Fetch 4× more results than needed. The interviewds datasource is shared
+    # across sandbox candidates, so our documents may not rank in the top 5
+    # even when they are the most relevant for the user's question. Fetching
+    # up to 20 and post-filtering by exact URL allowlist reliably finds them.
+    fetch_size = min(page_size * 4, 20)
+
+    logger.info("Searching datasource='%s' keywords='%s' top_k=%d (fetching %d)",
+                datasource, keywords, page_size, fetch_size)
 
     with _glean_client() as glean:
         response = glean.client.search.query(
             query=keywords,
-            page_size=page_size,
+            page_size=fetch_size,
             request_options=models.SearchRequestOptions(
                 facet_bucket_size=10,
                 datasources_filter=[datasource],
