@@ -196,6 +196,72 @@ cleaned = re.sub(r"[?,'\"():;/]", " ", question.lower())
 
 ---
 
+## Fix 12 — Generic queries returning zero Lumina results
+
+**Symptom**: Querying `"Can you summarize the onboarding checklist?"` returned *"I don't have that information in the Lumina knowledge base"* even though the Employee Onboarding Guide clearly contains a detailed first-week checklist.
+
+**Root cause (two parts)**:
+
+1. **Task verbs in the keyword query**: The keyword extractor passed `"summarize onboarding checklist"` to the Search API. The word `"summarize"` doesn't appear in any of our documents but does appear in other candidates' documents, causing their docs to rank above ours for this query.
+
+2. **Fetch size too small**: Our document ranked at position **10** in the shared `interviewds` datasource for `"onboarding checklist"` — other candidates have more documents explicitly titled "onboarding checklist". We were only fetching 5 results, so ours never made it into the filter.
+
+**Diagnosis**: Ran a direct API probe fetching 20 results and printing their positions:
+```
+ 1. Employee Onboarding Checklist   (another candidate)
+...
+10. Employee Onboarding Guide       https://internal.example.com/policies/employee-onboarding  ← OUR DOC
+```
+
+**Fix**:
+
+1. Expanded the stop words list to include task-instruction verbs — words that describe what to *do* with content rather than what to *find*:
+```python
+"summarize", "summary", "explain", "description", "describe", "list",
+"detail", "details", "outline", "provide", "please", "help",
+"overview", "walkthrough", "breakdown",
+```
+
+2. Increased fetch size from `page_size` (5) back to `min(page_size * 4, 20)` in the official client search call, matching the approach used before the `glean-api-client` migration. The URL allowlist then filters to our exact 7 documents from the broader result set.
+
+3. Increased `MAX_CONTENT_CHARS_PER_DOC` from 1500 to 2500 so longer sections (like multi-day checklists) are fully captured in the Chat context.
+
+**Result**: `"Can you summarize the onboarding checklist?"` now extracts keywords `"onboarding checklist"`, finds the Employee Onboarding Guide at position 10 out of 20 fetched, and returns the full Day 1 / Days 2–5 checklist with sources.
+
+---
+
+## Fix 13 — High latency (10–20s responses)
+
+**Symptom**: Every query to the MCP tool took 10–20 seconds to respond. Users experienced a long blank wait before seeing any output.
+
+**Diagnosis**: Added timestamps around each pipeline step to isolate the bottleneck:
+
+| Step | Time |
+|---|---|
+| Glean Search API | ~500ms |
+| Local content enrichment | ~6ms |
+| Glean Chat API | ~10–17s |
+
+The Glean Chat API accounts for ~95% of total latency. This is a sandbox infrastructure limitation — the shared sandbox is not optimised for throughput in the way a production deployment would be.
+
+**What we cannot fix**: The Chat API response time itself. The prompt is already size-capped at 2500 chars per document, and the official client's `timeout_ms` is set correctly. The sandbox will simply be slower than production.
+
+**Fix**: Added a `fast_mode` parameter to `ask()` and `ask_lumina` that bypasses the Glean Chat API entirely and returns the search excerpts directly:
+
+```python
+# Normal mode: Search (~500ms) + Chat (~15s) = ~16s total
+result = ask("What is the parental leave policy?")
+
+# Fast mode: Search (~500ms) only = ~800ms total
+result = ask("What is the parental leave policy?", fast_mode=True)
+```
+
+Both modes return grounded content from indexed Lumina documents with source citations. `fast_mode` trades a synthesised answer for an immediate response — the raw excerpt contains the key information for most factual lookups.
+
+In production, the correct fix for perceived latency is **streaming** — the Chat API supports `stream: true`, which sends tokens as they are generated. Users would see the answer building word by word rather than waiting 15 seconds for nothing.
+
+---
+
 ## Summary table
 
 | # | Issue | Root cause | Fix |
@@ -211,3 +277,5 @@ cleaned = re.sub(r"[?,'\"():;/]", " ", question.lower())
 | 9 | Other candidates' docs returned | Shared sandbox; same URL prefix used by others | Exact URL allowlist for our 7 documents |
 | 10 | Sources not shown to user | Claude Desktop model paraphrasing tool output | MCP server instructions field |
 | 11 | Punctuation in queries | Keyword extractor didn't strip commas etc. | Regex strip of punctuation before tokenising |
+| 12 | Generic queries returning 0 results | Task verbs in keywords; doc ranked at position 10 | Strip task verbs; fetch 20 results before filtering |
+| 13 | High latency (10–20s) | Glean Chat API is 95% of response time in sandbox | fast_mode param bypasses Chat for ~800ms responses |
