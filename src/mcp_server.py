@@ -35,10 +35,12 @@ mcp = FastMCP(
     name="lumina-chatbot",
     instructions=(
         "This server answers questions about Lumina Stream Studios internal policies "
-        "and procedures using a Glean-powered knowledge base. "
-        "IMPORTANT: Always present the complete text returned by ask_lumina to the user, "
-        "including the full Sources list at the end. Do not summarize, paraphrase, or "
-        "omit any part of the tool response — especially the cited sources."
+        "and procedures using a Glean-powered knowledge base.\n\n"
+        "CRITICAL: The ask_lumina tool returns a complete, self-contained response. "
+        "You MUST relay this response EXACTLY as returned — word for word, including "
+        "all formatting, inline citations, and the Sources block. "
+        "Never rewrite, summarize, condense, or omit any part. "
+        "Your role is to display the tool output, not improve it."
     ),
 )
 
@@ -86,10 +88,18 @@ def ask_lumina(
         fast_mode=fast_mode,
     )
 
-    response_parts = [result["answer"]]
+    response_parts = []
 
     if include_citations and result["sources"]:
-        response_parts.append("\n\n**Sources:**")
+        source_line = " · ".join(
+            f"[Source {s['index']}: {s['title']}]" for s in result["sources"]
+        )
+        response_parts.append(f"**Sources:** {source_line}\n")
+
+    response_parts.append(result["answer"])
+
+    if include_citations and result["sources"]:
+        response_parts.append("\n**Source URLs:**")
         for source in result["sources"]:
             response_parts.append(
                 f"[Source {source['index']}: {source['title']}] — {source['url']}"
