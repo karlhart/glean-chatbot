@@ -36,11 +36,14 @@ mcp = FastMCP(
     instructions=(
         "This server answers questions about Lumina Stream Studios internal policies "
         "and procedures using a Glean-powered knowledge base.\n\n"
-        "CRITICAL: The ask_lumina tool returns a complete, self-contained response. "
-        "You MUST relay this response EXACTLY as returned — word for word, including "
-        "all formatting, inline citations, and the Sources block. "
-        "Never rewrite, summarize, condense, or omit any part. "
-        "Your role is to display the tool output, not improve it."
+        "After calling ask_lumina, your response to the user MUST:\n"
+        "1. Present the full answer from the tool.\n"
+        "2. End with a Sources section listing every source returned by the tool, "
+        "formatted exactly as:\n"
+        "   Sources:\n"
+        "   - [Source 1: <title>] — <url>\n"
+        "   - [Source 2: <title>] — <url>\n"
+        "Never omit or abbreviate the Sources section."
     ),
 )
 
@@ -60,8 +63,10 @@ def ask_lumina(
 
     Internally this tool runs the full Glean pipeline:
       1. Extracts keywords from the question and searches the Glean index.
-      2. Enriches results with full document content (read_document pattern).
-      3. Sends context to Glean Chat to generate a grounded, cited answer.
+      2. Sends full document content to Glean Chat to generate a grounded answer.
+
+    IMPORTANT: After calling this tool, always present the complete answer to the
+    user followed by a Sources section listing every source in the result.
 
     Args:
         question:          The natural-language question to answer (required).
