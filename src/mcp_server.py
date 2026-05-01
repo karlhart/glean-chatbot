@@ -41,8 +41,7 @@ mcp = FastMCP(
         "2. End with a Sources section listing every source returned by the tool, "
         "formatted exactly as:\n"
         "   Sources:\n"
-        "   - [Source 1: <title>] — <url>\n"
-        "   - [Source 2: <title>] — <url>\n"
+        "   - [Title](URL)\n"
         "Never omit or abbreviate the Sources section."
     ),
 )
@@ -53,7 +52,6 @@ def ask_lumina(
     question: str,
     datasource: str = "interviewds",
     top_k: int = 5,
-    include_citations: bool = True,
     after_date: Optional[str] = None,
     before_date: Optional[str] = None,
     fast_mode: bool = False,
@@ -65,50 +63,45 @@ def ask_lumina(
       1. Extracts keywords from the question and searches the Glean index.
       2. Sends full document content to Glean Chat to generate a grounded answer.
 
-    IMPORTANT: After calling this tool, always present the complete answer to the
-    user followed by a Sources section listing every source in the result.
+    CRITICAL INSTRUCTIONS FOR CLAUDE: This tool returns a fully synthesized,
+    grounded answer that already includes inline citations and a formatted Sources
+    footer. You MUST present the EXACT output of this tool back to the user verbatim.
+    Do not paraphrase the answer, do not summarize it, and absolutely DO NOT remove
+    the Sources section or URLs.
 
     Args:
-        question:          The natural-language question to answer (required).
-        datasource:        Glean datasource to search within (default: interviewds).
-        top_k:             Number of search results to retrieve, max 5 (default: 5).
-        include_citations: Whether to append source references to the answer (default: True).
-        after_date:        Only include documents updated after this date (YYYY-MM-DD).
-        before_date:       Only include documents updated before this date (YYYY-MM-DD).
-        fast_mode:         Skip Glean Chat and return search excerpts directly (~500ms
-                           instead of 10-20s). Use when speed matters more than a
-                           synthesised answer (default: False).
+        question:    The natural-language question to answer (required).
+        datasource:  Glean datasource to search within (default: interviewds).
+        top_k:       Number of search results to retrieve, max 5 (default: 5).
+        after_date:  Only include documents updated after this date (YYYY-MM-DD).
+        before_date: Only include documents updated before this date (YYYY-MM-DD).
+        fast_mode:   Skip Glean Chat and return search excerpts directly (~500ms
+                     instead of 10-20s). Use when speed matters more than a
+                     synthesised answer (default: False).
 
     Returns:
-        A formatted string containing the grounded answer and, if include_citations
-        is True, a list of source documents with titles and URLs.
+        A fully formatted string with the grounded answer and a Sources section.
+        Citations are always included and cannot be disabled.
     """
+    # Citations are hardcoded to True — removing the parameter from the schema
+    # prevents Claude from setting include_citations=False when summarising,
+    # which would silently strip all source attribution from the response.
     result = ask(
         question=question,
         datasource=datasource,
         top_k=top_k,
-        include_citations=include_citations,
+        include_citations=True,
         after_date=after_date,
         before_date=before_date,
         fast_mode=fast_mode,
     )
 
-    response_parts = []
+    response_parts = [result["answer"]]
 
-    if include_citations and result["sources"]:
-        source_line = " · ".join(
-            f"[Source {s['index']}: {s['title']}]" for s in result["sources"]
-        )
-        response_parts.append(f"**Sources:** {source_line}\n")
-
-    response_parts.append(result["answer"])
-
-    if include_citations and result["sources"]:
-        response_parts.append("\n**Source URLs:**")
+    if result["sources"]:
+        response_parts.append("\n\n**Sources:**")
         for source in result["sources"]:
-            response_parts.append(
-                f"[Source {source['index']}: {source['title']}] — {source['url']}"
-            )
+            response_parts.append(f"- [{source['title']}]({source['url']})")
 
     return "\n".join(response_parts)
 
