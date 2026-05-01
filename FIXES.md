@@ -346,3 +346,37 @@ result = ask(
 | 13 | High latency (10–20s) | Glean Chat API is 95% of response time in sandbox | fast_mode param bypasses Chat for ~800ms responses |
 | 14 | Manual local-file enrichment | Prototype-only workaround; breaks in production | returnLlmContentOverSnippets=True returns full content from Glean directly |
 | 15 | Sources silently stripped | Claude Desktop passed include_citations=False for "summarize" requests | Removed parameter; hardcoded citations=True in tool |
+
+---
+
+## Known Limitation — Claude Desktop citation rendering after `returnLlmContentOverSnippets`
+
+**Symptom**: After implementing `returnLlmContentOverSnippets=True` (Fix 14), citations and source URLs stopped appearing consistently in Claude Desktop responses. The CLI (`python src/chatbot.py "..."`) continued to return fully cited, grounded answers. Claude Desktop produced clean, accurate answers with no source attribution.
+
+**Root cause — architectural, not a bug**: Confirmed via MCP server logs (`~/Library/Logs/Claude/mcp-server-lumina-chatbot.log`). The tool was returning the complete response including sources:
+
+```
+For filming in the UK, Lumina can access the HETV program... [Source 1: International Co-Production Guidelines]
+
+**Sources:**
+[1] **International Co-Production Guidelines**
+    https://internal.example.com/policies/international-coproduction-guidelines
+```
+
+Claude Desktop received this verbatim. It then generated its own response to the user, treating the tool result as retrieved context rather than final output to relay. The model's synthesis step discards citation markers and source footers as formatting metadata.
+
+The richer content returned by `returnLlmContentOverSnippets` (4,000 chars of well-structured document text vs. 255-char snippets) made Glean Chat produce higher-quality, more polished answers — which paradoxically made Claude Desktop more likely to synthesise its own clean response rather than relay the tool output.
+
+**Fixes attempted — all insufficient**:
+1. Strengthened MCP `instructions` field ("relay verbatim") — ignored; Claude Desktop synthesises regardless
+2. Moved sources before the answer — still dropped during synthesis
+3. Changed `instructions` to action-based ("end your response with a Sources section") — partially followed but inconsistent
+4. Removed `include_citations` parameter (Fix 15) — fixed silent stripping, but sources still dropped post-synthesis
+5. Changed inline citation format to markdown links `[Title](URL)` — made attribution worse, reverted
+6. Strengthened tool docstring with "CRITICAL: do not paraphrase" — insufficient
+
+**Why it cannot be fully fixed from the MCP server**: The MCP protocol returns tool results as text content to the orchestrating model. What that model does with the content — relay it or synthesise a new response — is determined by the client (Claude Desktop), not the server. There is no MCP mechanism to force verbatim relay of tool output.
+
+**Workaround for demos**: Run `python src/chatbot.py "<question>"` directly. The CLI always returns the full cited response with source URLs. This is the reliable way to demonstrate grounded answers with citations.
+
+**Production fix**: Stream the Glean Chat response directly to a custom UI rather than routing it through a second LLM. When tool output goes directly to a renderer (not through Claude Desktop's model), citations are preserved exactly as the pipeline produces them.
