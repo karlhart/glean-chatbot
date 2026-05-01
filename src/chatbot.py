@@ -212,11 +212,17 @@ def _build_chat_prompt(question: str, results: list[dict]) -> str:
         context_blocks.append(f"[Source {i}: {r['title']}]\nURL: {r['url']}\n\n{r['snippet']}")
 
     context = "\n\n---\n\n".join(context_blocks)
+    # Inline citations use markdown link format [Title](URL) so the URL survives
+    # even when an orchestrating LLM paraphrases the response. Plain [Source N]
+    # tags are treated as metadata and stripped; markdown links look like content.
+    example_title = results[0]["title"] if results else "Employee Onboarding Guide"
+    example_url = results[0]["url"] if results else "https://internal.example.com/policies/employee-onboarding"
     return (
         "You are a helpful assistant for Lumina Stream Studios employees. "
         "Answer the question using ONLY the internal documents provided below. "
-        "After each fact or claim, cite the source document by name and number "
-        "in this format: [Source 1: Employee Onboarding Guide]. "
+        "After each fact or claim, cite the source as a markdown link in this format: "
+        f"[{example_title}]({example_url}). "
+        "Use the exact title and URL from the source headers above. "
         "If the answer cannot be found in the provided documents, say explicitly: "
         "'I don't have that information in the Lumina knowledge base.' "
         "Do not use outside knowledge or invent information.\n\n"
