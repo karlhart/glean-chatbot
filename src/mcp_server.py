@@ -101,7 +101,7 @@ def ask_lumina(
     if result["sources"]:
         response_parts.append("\n\n**Sources:**")
         for source in result["sources"]:
-            response_parts.append(f"- [{source['title']}]({source['url']})")
+            response_parts.append(f"[{source['index']}] **{source['title']}**\n    {source['url']}")
 
     return "\n".join(response_parts)
 
