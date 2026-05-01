@@ -251,3 +251,75 @@ Example output:
     Sources: Employee Onboarding Guide, IT Security & Access Control Policy
     Answer preview: Lumina's parental leave policy provides 16 weeks fully paid...
 ```
+
+---
+
+## What I'd Do Next (Production Path)
+
+1. **Expand document ingestion beyond Markdown**  
+   `indexer.py` currently only reads `.md` files. A production ingestion pipeline should handle any file type employees actually use — `.pdf`, `.docx`, `.pptx`, `.txt`, and `.html` at minimum. Each format needs a parser to extract clean plain text before indexing (e.g. `pdfplumber` for PDFs, `python-docx` for Word files, `python-pptx` for decks). The indexer would detect file extension, route to the appropriate parser, and fall back to raw text extraction for unknown types. This also opens the door to watching a shared Drive folder or Box directory and re-indexing on file change events.
+
+2. **Sync permissions from source systems**  
+   Replace `allowAllDatasourceUsersAccess: true` with per-document ACLs pulled from the source system at index time — Google Drive sharing settings, Box collaborator lists, Confluence space permissions. The Indexing API supports `allowedUsers`, `allowedGroups`, and `denyUsers` fields on each document. Combined with `X-Glean-ActAs` set to the logged-in user's email on every Search/Chat request, this ensures Glean enforces the same access controls the source system would.
+
+3. **Multi-turn conversation**  
+   Use the Chat API's `chatId` field to maintain session context across follow-up questions. The first response returns a `chatId`; subsequent requests include it so Glean Chat can reference earlier turns. The MCP tool would accept an optional `chat_id` parameter and return the new `chatId` alongside the answer.
+
+4. **Streaming responses**  
+   Switch to `POST /rest/api/v1/chat` with `stream: true` for real-time token delivery. Users would see the answer building word by word rather than waiting 10–20 seconds for nothing. The `glean-api-client` supports this via `client.client.chat.create_stream()`. For the MCP tool this requires restructuring the return to emit progressive updates rather than a single string.
+
+5. **Observability with OpenTelemetry**  
+   Instrument the pipeline with the [OpenTelemetry Python SDK](https://opentelemetry.io/docs/languages/python/) to emit traces and metrics to any compatible backend (Datadog, Honeycomb, Grafana Tempo, etc.):
+
+   ```python
+   from opentelemetry import trace
+   from opentelemetry.sdk.trace import TracerProvider
+   from opentelemetry.sdk.trace.export import BatchSpanProcessor
+   from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+   tracer = trace.get_tracer("lumina-chatbot")
+
+   with tracer.start_as_current_span("ask_lumina") as span:
+       span.set_attribute("question", question)
+       span.set_attribute("datasource", datasource)
+       span.set_attribute("fast_mode", fast_mode)
+       # ... pipeline runs ...
+       span.set_attribute("search.results_returned", len(results))
+       span.set_attribute("search.results_after_filter", len(filtered))
+       span.set_attribute("chat.timed_out", timed_out)
+       span.set_attribute("answer.length_chars", len(answer))
+   ```
+
+   Key spans to instrument: `search`, `enrich`, `chat`, and `ask_lumina` (parent). Key attributes per span: `glean.request_id`, `glean.backend_time_ms`, result counts, and whether the Chat fallback was triggered.
+
+   **Metrics to expose** (via `opentelemetry-sdk-metrics`):
+   - `chatbot.search.latency_ms` — histogram
+   - `chatbot.chat.latency_ms` — histogram
+   - `chatbot.chat.timeout_rate` — counter
+   - `chatbot.search.zero_result_rate` — counter
+   - `chatbot.requests.total` — counter by `datasource`, `fast_mode`
+
+   **Alerts**: P99 total latency > 15s, zero-result rate > 10% (signals indexing gap), Chat timeout rate > 20%.
+
+6. **Token usage tracking for cost optimisation**  
+   The Glean Chat API returns token usage metadata in the response. Capture and log it on every call:
+
+   ```python
+   # After chat.create() returns:
+   usage = getattr(response, "usage", None)
+   if usage:
+       logger.info("Chat token usage — prompt: %d, completion: %d, total: %d",
+                   usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
+       span.set_attribute("llm.prompt_tokens", usage.prompt_tokens)
+       span.set_attribute("llm.completion_tokens", usage.completion_tokens)
+   ```
+
+   Aggregate token counts per `datasource`, `top_k`, and `fast_mode` to answer: which query patterns are most expensive? Does increasing `top_k` from 3 to 5 meaningfully improve answer quality relative to the token cost increase? Is `fast_mode` (zero Chat tokens) a worthwhile default for simple lookups?
+
+   In production, route this data to a cost dashboard alongside Glean's own usage reporting to track spend per team, per feature, and over time.
+
+7. **Scheduled re-indexing**  
+   Run `indexer.py` on a cron schedule (or triggered by file change webhooks from Google Drive/Box) to keep the Glean index current with the latest document versions.
+
+8. **Multi-datasource search**  
+   Remove the datasource filter to enable cross-system search — Drive scripts, Box contracts, Slack threads, and Jira tickets — in a single query, returning the most relevant result regardless of source.
