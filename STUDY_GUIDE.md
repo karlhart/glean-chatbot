@@ -581,6 +581,7 @@ These are the non-obvious issues that came up during development. Knowing them d
 | 10 | Sources not shown | Claude Desktop paraphrases tool output, drops Sources | MCP `instructions` field tells the model to present verbatim |
 | 11 | Commas in queries | Keyword extractor didn't strip punctuation | Regex strip before tokenising |
 | 14 | Local file enrichment (prototype-only) | Production docs are remote — can't read from disk | `returnLlmContentOverSnippets=True` returns full content from Glean |
+| 15 | Sources silently stripped on "summarize" | Claude Desktop passed `include_citations=False` | Removed parameter from schema; hardcoded `True` in tool |
 
 ---
 

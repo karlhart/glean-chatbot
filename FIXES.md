@@ -297,6 +297,36 @@ The `snippets[].text` field in each result now contains up to 4,000 chars of doc
 
 ---
 
+## Fix 15 — `include_citations=False` silently stripped all sources
+
+**Symptom**: Claude Desktop returned complete, accurate answers with no source citations — even after multiple attempts to strengthen the MCP `instructions` field and reformat the tool response.
+
+**Root cause**: The `ask_lumina` tool exposed `include_citations` as an optional boolean parameter. When a user asks Claude Desktop to *"summarize"* something, Claude Desktop's model infers that citations are unnecessary for a summary and passes `include_citations=False` to the tool. This happens silently at the tool-call layer, before the tool returns anything — no amount of MCP instructions or response formatting can recover sources that were never put into the result in the first place.
+
+**Diagnosis**: The CLI (`python src/chatbot.py "..."`) produced a fully cited response, confirming the pipeline was correct. The failure was at the Claude Desktop invocation layer, not in the chat or search logic. Removing the parameter from the schema (so Claude Desktop cannot pass it) was the fix.
+
+**Lesson — tool schema design**: Optional boolean parameters that control output verbosity or attribution are dangerous when the tool is called by an orchestrating LLM. The LLM will set them to `False` in compression contexts (summaries, concise requests, long conversations where context pressure is high). Any output that the tool *must always* include — citations, attributions, warnings — should not be gated behind an optional parameter.
+
+**Fix**:
+- Removed `include_citations` from the `ask_lumina` signature entirely
+- Hardcoded `include_citations=True` in the `ask()` call inside the tool
+- Simplified output to clean standard Markdown links: `- [Title](URL)`
+- Added a comment explaining why the parameter was removed, for future maintainers
+
+```python
+# Citations are hardcoded to True — removing the parameter from the schema
+# prevents Claude from setting include_citations=False when summarising,
+# which would silently strip all source attribution from the response.
+result = ask(
+    question=question,
+    ...
+    include_citations=True,
+    ...
+)
+```
+
+---
+
 ## Summary table
 
 | # | Issue | Root cause | Fix |
@@ -315,3 +345,4 @@ The `snippets[].text` field in each result now contains up to 4,000 chars of doc
 | 12 | Generic queries returning 0 results | Task verbs in keywords; doc ranked at position 10 | Strip task verbs; fetch 20 results before filtering |
 | 13 | High latency (10–20s) | Glean Chat API is 95% of response time in sandbox | fast_mode param bypasses Chat for ~800ms responses |
 | 14 | Manual local-file enrichment | Prototype-only workaround; breaks in production | returnLlmContentOverSnippets=True returns full content from Glean directly |
+| 15 | Sources silently stripped | Claude Desktop passed include_citations=False for "summarize" requests | Removed parameter; hardcoded citations=True in tool |
