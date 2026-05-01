@@ -36,6 +36,7 @@ Search retrieves relevant document snippets for the user's question. This serves
 
 **Key design choices:**
 - I scope search to the specific datasource (`datasourcesFilter`) so results come only from indexed Lumina documents, not from noise in the broader Glean index. In production, you might broaden this to search across all connected datasources so the chatbot can answer questions that span Drive, Slack, and Confluence simultaneously.
+- `returnLlmContentOverSnippets: true` is set on every search request. This returns up to `maxSnippetSize` characters of full document content per result (instead of the default ~255-char relevance snippet), eliminating any need for a separate `read_document` step. In a production deployment, indexed documents are remote — `returnLlmContentOverSnippets` is how you get full content without local file access. The prototype sets `maxSnippetSize=4000`; the API supports up to 10,000.
 - `pageSize` is configurable via `top_k` (default 5). More results give Chat more context but increase prompt length and latency.
 - The `X-Glean-ActAs` header is required for Global tokens so that Glean enforces per-user document permissions. Without it, the API returns a 401.
 
@@ -90,6 +91,7 @@ Chat generates a grounded natural-language answer. I inject the Search results d
 | Decision | Choice | Alternative | Reason |
 |---|---|---|---|
 | Indexing mode | Incremental (`/indexdocuments`) | Bulk (`/bulkindexdocuments`) | Safer for ongoing use; bulk deletes unincluded docs |
+| Document content | returnLlmContentOverSnippets=True (4000 chars from Glean) | Local file read (prototype workaround) | Production-correct; remote docs don't have local copies |
 | Context injection | Explicit (inject search results into prompt) | Native (let Chat do its own retrieval) | Datasource scoping; predictable grounding |
 | Auth scope | Global token + X-Glean-ActAs | User-scoped tokens | Simpler for single-service demo; user tokens preferred in prod |
 | Conversation model | Stateless (single turn) | Multi-turn via chatId | Scope; multi-turn is the obvious next step |

@@ -1,15 +1,12 @@
 """
-Core chatbot workflow: Search → Read → Chat → grounded answer with citations.
+Core chatbot workflow: Search → Chat → grounded answer with citations.
 
-Uses the official Glean Python client (glean-api-client) for Search and Chat,
-replacing raw requests calls. Key benefits over the manual approach:
-  - FacetFilter(field_name="app") correctly scopes search to our datasource
-  - Client handles auth headers, retries, and response parsing
-  - No URL-based workarounds needed for datasource filtering
+Uses the official Glean Python client (glean-api-client) for Search and Chat.
 
 Per Glean MCP guidelines:
   - Search queries must be short targeted keywords, not full sentences.
-  - Full document content (read_document pattern) produces better Chat answers.
+  - returnLlmContentOverSnippets=True returns up to maxSnippetSize chars of
+    full document content per result, replacing any manual read_document step.
   - Chat prompt must explicitly instruct the model not to hallucinate.
 """
 
@@ -51,7 +48,6 @@ DATASOURCE = os.environ.get("GLEAN_DATASOURCE", "interviewds")
 ACT_AS = os.environ.get("GLEAN_ACT_AS", "")
 
 SERVER_URL = f"https://{INSTANCE}-be.glean.com"
-DOCS_DIR = Path(__file__).parent.parent / "docs"
 INTRANET_BASE = "https://internal.example.com/policies"
 
 # Exact URLs of the documents we indexed. The interviewds datasource is shared
@@ -71,7 +67,10 @@ KNOWN_URLS = {
 }
 
 MAX_CONTEXT_RESULTS = 5
-MAX_CONTENT_CHARS_PER_DOC = 2500
+# Maximum characters of LLM content to request per document from Glean Search.
+# returnLlmContentOverSnippets supports up to 10,000 chars; 4,000 keeps prompts
+# manageable while providing far more context than the default ~255-char snippet.
+MAX_SNIPPET_SIZE = 4000
 
 _STOP_WORDS = {
     # Articles, pronouns, prepositions
@@ -120,56 +119,6 @@ def _extract_keywords(question: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Document content enrichment (read_document pattern)
-# ---------------------------------------------------------------------------
-
-def _load_full_content(url: str) -> Optional[str]:
-    """
-    Return the full text of a document given its view URL.
-
-    Implements the Glean MCP "search → read_document" pattern.
-    Resolves our INTRANET_BASE URLs back to local markdown files.
-    """
-    if url not in KNOWN_URLS:
-        return None
-    stem = url.rsplit("/", 1)[-1]
-    candidate = DOCS_DIR / f"{stem}.md"
-    if candidate.exists():
-        return candidate.read_text(encoding="utf-8")
-    return None
-
-
-def _enrich_with_full_content(results: list[dict]) -> list[dict]:
-    """
-    Replace snippet text with full document content where available.
-
-    Leads with the snippet (Glean's most-relevant excerpt) then appends
-    additional document context up to MAX_CONTENT_CHARS_PER_DOC, so
-    truncation never loses the key section.
-    """
-    enriched = []
-    for r in results:
-        full_text = _load_full_content(r["url"])
-        if full_text:
-            snippet = r["snippet"]
-            remaining = MAX_CONTENT_CHARS_PER_DOC - len(snippet)
-            if remaining > 200:
-                extra = full_text[:remaining]
-                content = f"{snippet}\n\n[Additional context:]\n{extra}"
-                if len(full_text) > remaining:
-                    content += "\n[... document truncated ...]"
-            else:
-                content = snippet
-        else:
-            content = r["snippet"]
-        enriched.append({**r, "content": content, "has_full_content": full_text is not None})
-
-    logger.info("Enriched %d/%d results with full document content.",
-                sum(1 for r in enriched if r["has_full_content"]), len(enriched))
-    return enriched
-
-
-# ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
 
@@ -183,6 +132,8 @@ def search(
     """
     Search Glean for relevant documents using the official Python client.
 
+    Uses returnLlmContentOverSnippets=True so each result contains up to
+    MAX_SNIPPET_SIZE chars of full document content — no separate read step needed.
     Uses datasources_filter in SearchRequestOptions to scope results to our datasource.
     """
     page_size = min(top_k, MAX_CONTEXT_RESULTS)
@@ -206,9 +157,11 @@ def search(
         response = glean.client.search.query(
             query=keywords,
             page_size=fetch_size,
+            max_snippet_size=MAX_SNIPPET_SIZE,
             request_options=models.SearchRequestOptions(
                 facet_bucket_size=10,
                 datasources_filter=[datasource],
+                returnLlmContentOverSnippets=True,
             ),
         )
 
@@ -256,8 +209,7 @@ def _build_chat_prompt(question: str, results: list[dict]) -> str:
     """
     context_blocks = []
     for i, r in enumerate(results, start=1):
-        content = r.get("content", r["snippet"])
-        context_blocks.append(f"[Source {i}: {r['title']}]\nURL: {r['url']}\n\n{content}")
+        context_blocks.append(f"[Source {i}: {r['title']}]\nURL: {r['url']}\n\n{r['snippet']}")
 
     context = "\n\n---\n\n".join(context_blocks)
     return (
@@ -289,8 +241,7 @@ def chat(question: str, results: list[dict]) -> str:
     gets a grounded response even when Chat is slow.
     """
     prompt = _build_chat_prompt(question, results)
-    logger.info("Calling Glean Chat with %d document(s) (%d with full content).",
-                len(results), sum(1 for r in results if r.get("has_full_content")))
+    logger.info("Calling Glean Chat with %d document(s).", len(results))
 
     try:
         with _glean_client(timeout_ms=25000) as glean:
@@ -331,7 +282,11 @@ def ask(
     fast_mode: bool = False,
 ) -> dict:
     """
-    Full pipeline: search → enrich with full content → chat → grounded answer.
+    Full pipeline: search (with LLM content) → chat → grounded answer.
+
+    returnLlmContentOverSnippets=True means search results already contain full
+    document content (up to MAX_SNIPPET_SIZE chars), so no separate enrichment
+    step is needed.
 
     fast_mode=True skips the Glean Chat API entirely and returns the raw search
     excerpts. Responses come back in ~500ms instead of 10–20s. Useful when the
@@ -361,17 +316,15 @@ def ask(
             "sources": [],
         }
 
-    enriched = _enrich_with_full_content(results)
-
     if fast_mode:
         logger.info("fast_mode=True — skipping Chat API, returning search excerpts.")
-        answer = _snippets_fallback(question, enriched)
+        answer = _snippets_fallback(question, results)
     else:
-        answer = chat(question, results=enriched if include_citations else [])
+        answer = chat(question, results=results if include_citations else [])
 
     sources = []
     if include_citations:
-        for i, r in enumerate(enriched, start=1):
+        for i, r in enumerate(results, start=1):
             sources.append({
                 "index": i,
                 "title": r["title"],

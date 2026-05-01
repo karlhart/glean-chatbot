@@ -262,6 +262,41 @@ In production, the correct fix for perceived latency is **streaming** — the Ch
 
 ---
 
+## Fix 14 — Replace manual read_document enrichment with `returnLlmContentOverSnippets`
+
+**Discovery**: Reading the Glean Search API documentation revealed the `returnLlmContentOverSnippets` request parameter, which instructs Glean to return up to `maxSnippetSize` characters of full document content directly in the search response — instead of the default ~255-char relevance-ranked snippet.
+
+**What we had (workaround)**:
+- `search()` returned ~255-char snippets
+- `_enrich_with_full_content()` resolved each result's `viewURL` back to a local markdown file on disk, read the full content, and prepended snippet + appended additional context up to `MAX_CONTENT_CHARS_PER_DOC = 2500` chars
+- This only worked because our indexed documents happened to also exist as local files — a prototype-only assumption
+
+**Why this matters**: In a production deployment, indexed documents are remote (Google Drive, Confluence, Box). You don't have local copies. `returnLlmContentOverSnippets=True` is how you get full content without a separate `read_document` API call — Glean returns it directly in the search response.
+
+**Changes**:
+- Added `returnLlmContentOverSnippets=True` and `max_snippet_size=4000` to the `glean.client.search.query()` call
+- Removed `_load_full_content()`, `_enrich_with_full_content()`, `DOCS_DIR`, and `MAX_CONTENT_CHARS_PER_DOC`
+- Removed enrichment step from `ask()` — search results now contain full LLM-ready content directly
+- Updated `_build_chat_prompt()` to use `r["snippet"]` directly (now contains full content, not just the excerpt)
+
+**Key parameters**:
+```python
+response = glean.client.search.query(
+    query=keywords,
+    page_size=fetch_size,
+    max_snippet_size=4000,          # top-level SearchRequest param
+    request_options=models.SearchRequestOptions(
+        facet_bucket_size=10,
+        datasources_filter=[datasource],
+        returnLlmContentOverSnippets=True,  # SearchRequestOptions param
+    ),
+)
+```
+
+The `snippets[].text` field in each result now contains up to 4,000 chars of document content in document order, replacing both the old snippet text and the local file read.
+
+---
+
 ## Summary table
 
 | # | Issue | Root cause | Fix |
@@ -279,3 +314,4 @@ In production, the correct fix for perceived latency is **streaming** — the Ch
 | 11 | Punctuation in queries | Keyword extractor didn't strip commas etc. | Regex strip of punctuation before tokenising |
 | 12 | Generic queries returning 0 results | Task verbs in keywords; doc ranked at position 10 | Strip task verbs; fetch 20 results before filtering |
 | 13 | High latency (10–20s) | Glean Chat API is 95% of response time in sandbox | fast_mode param bypasses Chat for ~800ms responses |
+| 14 | Manual local-file enrichment | Prototype-only workaround; breaks in production | returnLlmContentOverSnippets=True returns full content from Glean directly |

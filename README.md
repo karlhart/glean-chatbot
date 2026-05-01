@@ -182,9 +182,11 @@ Key choices:
 
 Authenticated with the Client API token via the official `glean-api-client` Python library. Before querying, the user's natural-language question is reduced to discriminative keywords (stop words removed, punctuation stripped) per Glean's MCP guideline that the search engine is keyword-based, not semantic. Results are scoped to the target datasource using `SearchRequestOptions(datasources_filter=[datasource])` and further post-filtered to an exact URL allowlist to exclude other candidates' documents in the shared sandbox.
 
+`returnLlmContentOverSnippets=True` is set on every search request. This instructs Glean to return up to `maxSnippetSize` characters of full document content per result — replacing the default ~255-char relevance snippet — directly in the search response. No separate `read_document` call is needed. In a production deployment you cannot read indexed documents from local disk (they live in Drive, Confluence, Box), making this the correct production pattern. The prototype uses `maxSnippetSize=4000`; the API supports up to 10,000.
+
 **Glean Chat API** (`POST /rest/api/v1/chat`)
 
-Also via the official client. Retrieved document snippets are injected into the Chat prompt alongside an explicit anti-hallucination instruction: *"Answer using ONLY the provided documents. If the answer is not there, say so."* The prompt follows the Glean MCP read-document pattern — Glean's search snippet (the most relevant excerpt) is always included first, with additional document context appended up to a character cap. This ensures the key passage is never lost to truncation.
+Also via the official client. Retrieved document content (from `returnLlmContentOverSnippets`) is injected into the Chat prompt alongside an explicit anti-hallucination instruction: *"Answer using ONLY the provided documents. If the answer is not there, say so."* Each source block is prefixed with `[Source N: Title]` so citations in the answer are self-contained and render correctly in Claude Desktop.
 
 ---
 
@@ -200,10 +202,9 @@ Also via the official client. Retrieved document snippets are injected into the 
 2. QUERY (per ask_lumina invocation)
    User question
      → keyword extraction (strip stop words & punctuation)
-     → POST /rest/api/v1/search  (datasourcesFilter + URL allowlist)
-     → top-k results (title, URL, snippet)
-     → enrich with full local document content (read_document pattern)
-     → build grounded Chat prompt (snippet-first + additional context)
+     → POST /rest/api/v1/search  (datasourcesFilter + returnLlmContentOverSnippets=True + URL allowlist)
+     → top-k results (title, URL, full LLM content up to 4000 chars each)
+     → build grounded Chat prompt (full content + anti-hallucination instruction)
      → POST /rest/api/v1/chat  (25s timeout, snippet fallback on slow response)
      → extract answer text from response.messages[-1].fragments
      → return: { answer, sources: [{index, title, url}] }
@@ -220,6 +221,7 @@ Also via the official client. Retrieved document snippets are injected into the 
 |---|---|---|
 | Indexing mode | Incremental (`/indexdocuments`) | Safer for re-runs; bulk deletes all unincluded docs |
 | Search client | Official `glean-api-client` | Correct `datasourcesFilter` handling; handles auth/retries |
+| Document content | `returnLlmContentOverSnippets=True` (4000 chars from Glean) | Production-correct; remote docs don't have local copies |
 | Context injection | Explicit (inject results into Chat prompt) | Scopes Chat to our datasource; prevents answers from unindexed content |
 | Datasource filter | `datasourcesFilter` + exact URL allowlist | Shared sandbox requires allowlist; prefix matching alone was not exclusive |
 | Chat timeout | 25s with snippet fallback | Sandbox Chat is slow; fallback ensures the tool always returns grounded content |

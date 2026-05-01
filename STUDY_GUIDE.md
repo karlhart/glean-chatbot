@@ -55,20 +55,17 @@ User Question
 │  │    strip stop words + punctuation from question    │  │
 │  │                                                    │  │
 │  │  Step 2: search() → Glean Search API               │  │
+│  │    returnLlmContentOverSnippets=True (4000 chars)  │  │
 │  │    SearchRequestOptions(datasources_filter=[...])  │  │
 │  │    + URL allowlist post-filter                     │  │
-│  │    → top-K Lumina document snippets                │  │
+│  │    → top-K results with full LLM document content  │  │
 │  │                                                    │  │
-│  │  Step 3: _enrich_with_full_content()               │  │
-│  │    load full markdown from docs/                   │  │
-│  │    lead with snippet + append context to 1500 char │  │
-│  │                                                    │  │
-│  │  Step 4: chat() → Glean Chat API                   │  │
-│  │    anti-hallucination prompt + injected context    │  │
+│  │  Step 3: chat() → Glean Chat API                   │  │
+│  │    anti-hallucination prompt + injected content    │  │
 │  │    25s timeout; snippet fallback if slow           │  │
-│  │    → grounded answer with [1] [2] citations        │  │
+│  │    → grounded answer with [Source N: Title] cites  │  │
 │  │                                                    │  │
-│  │  Step 5: format sources list                       │  │
+│  │  Step 4: format sources list                       │  │
 │  └────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────┘
       │
@@ -121,7 +118,7 @@ ACT_AS = os.environ.get("GLEAN_ACT_AS", "")
 SERVER_URL = f"https://{INSTANCE}-be.glean.com"
 INTRANET_BASE = "https://internal.example.com/policies"
 MAX_CONTEXT_RESULTS = 5       # Glean recommends 3–5 results for Chat
-MAX_CONTENT_CHARS_PER_DOC = 1500  # keeps Chat prompts fast
+MAX_SNIPPET_SIZE = 4000       # chars of LLM content per doc (API max: 10,000)
 ```
 
 `_require_env()` validates at startup and raises a clear `EnvironmentError` rather than a cryptic `KeyError` mid-request.
@@ -160,31 +157,38 @@ Per Glean MCP guidelines: *"Queries MUST be a SHORT sequence of highly targeted,
 
 **Example**: `"What is Lumina's parental leave policy?"` → `"lumina parental leave policy"`
 
-#### `_load_full_content(url)` and `_enrich_with_full_content(results)`
+#### `returnLlmContentOverSnippets` — full document content from Glean directly
 
-Implements the Glean MCP **read_document** pattern — after search returns URLs, fetch full document content rather than relying on snippets alone.
+The original prototype read local markdown files (`docs/`) to enrich search snippets with full content. This was a prototype-only workaround — in production, indexed documents are remote (Drive, Confluence, Box) and can't be read from disk.
 
-Our documents are local markdown files, so we resolve the URL back to `docs/{stem}.md`. In production, this step would call Glean's `read_document` endpoint.
+The correct pattern is `returnLlmContentOverSnippets=True` in `SearchRequestOptions`. Glean returns up to `maxSnippetSize` characters of full document content per result, directly in the search response — no separate `read_document` call needed.
 
-**Critical detail — snippet-first truncation**:
 ```python
-snippet = r["snippet"]
-remaining = MAX_CONTENT_CHARS_PER_DOC - len(snippet)
-content = f"{snippet}\n\n[Additional context:]\n{full_text[:remaining]}"
+response = glean.client.search.query(
+    query=keywords,
+    page_size=fetch_size,
+    max_snippet_size=MAX_SNIPPET_SIZE,       # top-level SearchRequest param
+    request_options=models.SearchRequestOptions(
+        facet_bucket_size=10,
+        datasources_filter=[datasource],
+        returnLlmContentOverSnippets=True,   # SearchRequestOptions param
+    ),
+)
 ```
-Always lead with Glean's snippet (which is already the most relevant excerpt, ranked by Glean). Appending additional context from the top of the document ensures the key passage is never lost when the relevant section is deep in a long file.
 
-If we just truncated from the top of the file, we'd miss sections that appear later (e.g. the VFX shot review process, which lives 60% of the way into `post-production-vfx-workflow.md`).
+The `snippets[].text` field in each result now contains full content in document order (up to 4,000 chars), replacing both the short relevance snippet and the old local file read. The `_enrich_with_full_content()` and `_load_full_content()` functions were removed entirely.
 
 #### `search(question, datasource, top_k, after_date, before_date)`
 
 ```python
 response = glean.client.search.query(
     query=keywords,
-    page_size=page_size,
+    page_size=fetch_size,
+    max_snippet_size=MAX_SNIPPET_SIZE,
     request_options=models.SearchRequestOptions(
         facet_bucket_size=10,
         datasources_filter=[datasource],
+        returnLlmContentOverSnippets=True,
     ),
 )
 ```
@@ -220,11 +224,10 @@ information."
 
 The public interface — orchestrates the full pipeline:
 
-1. `search()` → keyword query, URL-filtered results
+1. `search()` → keyword query, `returnLlmContentOverSnippets=True`, URL-filtered results with full content
 2. Empty-results guard → return early with "no documents found" rather than calling Chat with no context
-3. `_enrich_with_full_content()` → snippet + additional context per doc
-4. `chat()` → grounded answer, 25s timeout, fallback
-5. Format and return `{"answer": str, "sources": list[dict]}`
+3. `chat()` → grounded answer, 25s timeout, fallback
+4. Format and return `{"answer": str, "sources": list[dict]}`
 
 ---
 
@@ -372,13 +375,12 @@ A:
 1. MCP client invokes `ask_lumina` with the question and defaults.
 2. `ask_lumina` calls `ask()` in `chatbot.py`.
 3. `_extract_keywords()` reduces the question to `"parental leave policy"` (strips "what", "is", "the").
-4. `search()` POSTs to `/rest/api/v1/search` via the official client with `datasources_filter=["interviewds"]`, gets back up to 20 results, post-filters to our `KNOWN_URLS`, returns up to 5 Lumina documents.
-5. `_enrich_with_full_content()` loads each matched markdown file, leads with the Glean snippet, appends additional context up to 1500 chars.
-6. `chat()` builds a grounded prompt with anti-hallucination instruction, POSTs to `/rest/api/v1/chat` with `timeout_ms=25000`.
-7. Chat returns an answer citing `[1]` (employee-onboarding.md: 16 weeks primary / 6 weeks secondary).
-8. `ask()` returns `{"answer": "...", "sources": [{"title": "Employee Onboarding Guide", "url": "..."}]}`.
-9. `ask_lumina` appends a `**Sources:**` section and returns the full string to Claude Desktop.
-10. Claude Desktop presents the complete response including sources to the user.
+4. `search()` POSTs to `/rest/api/v1/search` via the official client with `datasources_filter=["interviewds"]` and `returnLlmContentOverSnippets=True`, gets back up to 20 results with up to 4,000 chars of full content each, post-filters to our `KNOWN_URLS`, returns up to 5 Lumina documents.
+5. `chat()` builds a grounded prompt with anti-hallucination instruction (using the full LLM content directly from search), POSTs to `/rest/api/v1/chat` with `timeout_ms=25000`.
+6. Chat returns an answer citing `[Source 1: Employee Onboarding Guide]` (16 weeks primary / 6 weeks secondary).
+7. `ask()` returns `{"answer": "...", "sources": [{"title": "Employee Onboarding Guide", "url": "..."}]}`.
+8. `ask_lumina` appends a `**Sources:**` section and returns the full string to Claude Desktop.
+9. Claude Desktop presents the complete response including sources to the user.
 
 **Q: Why the exact URL allowlist rather than just a datasource filter?**
 
@@ -578,6 +580,7 @@ These are the non-obvious issues that came up during development. Knowing them d
 | 9 | "Spellbook Manual" returned | Shared sandbox; another candidate used same URL prefix | Exact URL allowlist, not prefix matching |
 | 10 | Sources not shown | Claude Desktop paraphrases tool output, drops Sources | MCP `instructions` field tells the model to present verbatim |
 | 11 | Commas in queries | Keyword extractor didn't strip punctuation | Regex strip before tokenising |
+| 14 | Local file enrichment (prototype-only) | Production docs are remote — can't read from disk | `returnLlmContentOverSnippets=True` returns full content from Glean |
 
 ---
 
@@ -588,7 +591,7 @@ These are the non-obvious issues that came up during development. Knowing them d
 | Parameter | Value | Reasoning |
 |---|---|---|
 | `top_k` default | 5 | Glean recommends 3–5 results for Chat context |
-| `MAX_CONTENT_CHARS_PER_DOC` | 1500 | Keeps Chat prompts fast; snippet-first ensures relevance |
+| `MAX_SNIPPET_SIZE` | 4000 | LLM content chars per doc via returnLlmContentOverSnippets (API max: 10,000) |
 | Chat `timeout_ms` (client) | 25,000 ms | Leaves headroom within Claude Desktop's MCP call budget |
 | Chat `timeoutMillis` (payload) | 25,000 ms | Server-side Glean timeout |
 | Indexing propagation | ~15–20 min | Documents not immediately searchable after ingest |
