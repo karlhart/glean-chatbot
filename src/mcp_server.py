@@ -92,7 +92,7 @@ def ask_lumina(
         response_parts.append("\n\n**Sources:**")
         for source in result["sources"]:
             response_parts.append(
-                f"[{source['index']}] {source['title']} — {source['url']}"
+                f"[Source {source['index']}: {source['title']}] — {source['url']}"
             )
 
     return "\n".join(response_parts)

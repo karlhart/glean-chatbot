@@ -48,7 +48,7 @@ Chat generates a grounded natural-language answer. I inject the Search results d
 
 **Key design choices:**
 - **Explicit context injection**: I prepend retrieved document snippets to the question before sending to Chat. This is belt-and-suspenders grounding — the Chat API can also do its own retrieval natively from the full index, but scoping it to our specific datasource via the prompt ensures we don't hallucinate content from outside our document set.
-- **Source citation instructions**: The prompt instructs Glean Chat to use numbered references (`[1]`, `[2]`), making citations auditable.
+- **Source citation instructions**: The prompt instructs Glean Chat to cite each claim using the source number and document name — e.g. `[Source 1: Employee Onboarding Guide]`. Including the document name (not just a bare number) makes citations self-contained and readable even if the model re-presents or paraphrases the response.
 - **Single-turn only**: This prototype is stateless. The Chat API supports multi-turn conversations via `chatId`; adding that would be the first enhancement for a real deployment.
 
 ---

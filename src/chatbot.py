@@ -183,9 +183,7 @@ def search(
     """
     Search Glean for relevant documents using the official Python client.
 
-    Uses FacetFilter(field_name="app") to scope results to our datasource —
-    this is the correct parameter discovered from MCP matchingFilters, replacing
-    the URL-based workaround needed with raw REST calls.
+    Uses datasources_filter in SearchRequestOptions to scope results to our datasource.
     """
     page_size = min(top_k, MAX_CONTEXT_RESULTS)
     keywords = _extract_keywords(question)
@@ -259,13 +257,14 @@ def _build_chat_prompt(question: str, results: list[dict]) -> str:
     context_blocks = []
     for i, r in enumerate(results, start=1):
         content = r.get("content", r["snippet"])
-        context_blocks.append(f"[Source {i}] {r['title']}\nURL: {r['url']}\n\n{content}")
+        context_blocks.append(f"[Source {i}: {r['title']}]\nURL: {r['url']}\n\n{content}")
 
     context = "\n\n---\n\n".join(context_blocks)
     return (
         "You are a helpful assistant for Lumina Stream Studios employees. "
         "Answer the question using ONLY the internal documents provided below. "
-        "Cite sources using their numbers (e.g. [1], [2]). "
+        "After each fact or claim, cite the source document by name and number "
+        "in this format: [Source 1: Employee Onboarding Guide]. "
         "If the answer cannot be found in the provided documents, say explicitly: "
         "'I don't have that information in the Lumina knowledge base.' "
         "Do not use outside knowledge or invent information.\n\n"
@@ -277,7 +276,7 @@ def _snippets_fallback(question: str, results: list[dict]) -> str:
     """Return structured excerpts when Chat API is slow."""
     lines = ["Here are the most relevant excerpts from the Lumina knowledge base:\n"]
     for i, r in enumerate(results, start=1):
-        lines.append(f"[{i}] **{r['title']}**\n{r['snippet']}\n")
+        lines.append(f"[Source {i}: {r['title']}]\n{r['snippet']}\n")
     return "\n".join(lines)
 
 
@@ -400,4 +399,4 @@ if __name__ == "__main__":
     if result["sources"]:
         print("Sources:")
         for s in result["sources"]:
-            print(f"  [{s['index']}] {s['title']} — {s['url']}")
+            print(f"  [Source {s['index']}: {s['title']}] — {s['url']}")
