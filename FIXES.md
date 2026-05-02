@@ -327,6 +327,31 @@ result = ask(
 
 ---
 
+## Fix 16 — Replace Glean Chat with Claude API for synthesis
+
+**Motivation**: Glean Chat was the dominant source of latency (10–20s) in the sandbox and produced synthesis quality tied to Glean's internal model. Replacing it with the Claude API (`claude-opus-4-7`) gives direct control over the model, enables prompt caching on the static system prompt, and removes the sandbox-specific slowness.
+
+**Changes**:
+- Added `anthropic>=0.40.0` to `requirements.txt`
+- Added `ANTHROPIC_API_KEY` env var requirement
+- Extracted the static grounding instructions into `_CLAUDE_SYSTEM` constant with `cache_control: {type: "ephemeral"}` so the system prompt is cached across repeated calls
+- `_build_chat_prompt()` now returns only the document context + question (the varying part); grounding instructions moved to the system role
+- Replaced `chat()` to call `anthropic.Anthropic.messages.stream()` with `claude-opus-4-7`, adaptive thinking, and `get_final_message()` for the complete response
+- Glean Search pipeline (`search()`) is unchanged — Glean still provides retrieval and `returnLlmContentOverSnippets` content
+
+**Key parameters**:
+```python
+client.messages.stream(
+    model="claude-opus-4-7",
+    max_tokens=4096,
+    thinking={"type": "adaptive"},
+    system=[{"type": "text", "text": _CLAUDE_SYSTEM, "cache_control": {"type": "ephemeral"}}],
+    messages=[{"role": "user", "content": user_content}],
+)
+```
+
+---
+
 ## Summary table
 
 | # | Issue | Root cause | Fix |
@@ -346,6 +371,7 @@ result = ask(
 | 13 | High latency (10–20s) | Glean Chat API is 95% of response time in sandbox | fast_mode param bypasses Chat for ~800ms responses |
 | 14 | Manual local-file enrichment | Prototype-only workaround; breaks in production | returnLlmContentOverSnippets=True returns full content from Glean directly |
 | 15 | Sources silently stripped | Claude Desktop passed include_citations=False for "summarize" requests | Removed parameter; hardcoded citations=True in tool |
+| 16 | Glean Chat slow & opaque | Sandbox latency; no model control | Replace synthesis with Claude API (claude-opus-4-7) + prompt caching |
 
 ---
 

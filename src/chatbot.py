@@ -1,7 +1,8 @@
 """
-Core chatbot workflow: Search → Chat → grounded answer with citations.
+Core chatbot workflow: Search → Claude synthesis → grounded answer with citations.
 
-Uses the official Glean Python client (glean-api-client) for Search and Chat.
+Uses the official Glean Python client (glean-api-client) for Search and the
+Anthropic SDK (claude-opus-4-7) for synthesis.
 
 Per Glean MCP guidelines:
   - Search queries must be short targeted keywords, not full sentences.
@@ -16,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import anthropic
 from dotenv import load_dotenv
 from glean.api_client import Glean
 from glean.api_client import models
@@ -44,6 +46,7 @@ def _require_env(key: str) -> str:
 
 INSTANCE = _require_env("GLEAN_INSTANCE")
 CLIENT_TOKEN = _require_env("GLEAN_CLIENT_TOKEN")
+ANTHROPIC_API_KEY = _require_env("ANTHROPIC_API_KEY")
 DATASOURCE = os.environ.get("GLEAN_DATASOURCE", "interviewds")
 ACT_AS = os.environ.get("GLEAN_ACT_AS", "")
 
@@ -200,28 +203,25 @@ def search(
 # Chat
 # ---------------------------------------------------------------------------
 
-def _build_chat_prompt(question: str, results: list[dict]) -> str:
-    """
-    Build a grounded Chat prompt with explicit anti-hallucination instruction.
+# Static system prompt — cached across requests via prompt caching.
+_CLAUDE_SYSTEM = (
+    "You are a helpful assistant for Lumina Stream Studios employees. "
+    "Answer the question using ONLY the internal documents provided below. "
+    "After each fact or claim, cite the source document by name and number "
+    "in this format: [Source 1: Employee Onboarding Guide]. "
+    "If the answer cannot be found in the provided documents, say explicitly: "
+    "'I don't have that information in the Lumina knowledge base.' "
+    "Do not use outside knowledge or invent information."
+)
 
-    Per Glean MCP guidelines: "Only describe information actually returned by
-    tools. If the tools cannot find relevant results, say so explicitly."
-    """
+
+def _build_chat_prompt(question: str, results: list[dict]) -> str:
+    """Build the user-turn content: document context blocks followed by the question."""
     context_blocks = []
     for i, r in enumerate(results, start=1):
         context_blocks.append(f"[Source {i}: {r['title']}]\nURL: {r['url']}\n\n{r['snippet']}")
-
     context = "\n\n---\n\n".join(context_blocks)
-    return (
-        "You are a helpful assistant for Lumina Stream Studios employees. "
-        "Answer the question using ONLY the internal documents provided below. "
-        "After each fact or claim, cite the source document by name and number "
-        "in this format: [Source 1: Employee Onboarding Guide]. "
-        "If the answer cannot be found in the provided documents, say explicitly: "
-        "'I don't have that information in the Lumina knowledge base.' "
-        "Do not use outside knowledge or invent information.\n\n"
-        f"{context}\n\n---\n\nQuestion: {question}"
-    )
+    return f"{context}\n\n---\n\nQuestion: {question}"
 
 
 def _snippets_fallback(question: str, results: list[dict]) -> str:
@@ -234,36 +234,36 @@ def _snippets_fallback(question: str, results: list[dict]) -> str:
 
 def chat(question: str, results: list[dict]) -> str:
     """
-    Call the Glean Chat API via the official client and return the response.
+    Synthesize a grounded answer using Claude API (claude-opus-4-7).
 
-    Times out after 25 seconds to stay within Claude Desktop's MCP call budget.
-    Falls back to returning raw search snippets on timeout so the caller always
-    gets a grounded response even when Chat is slow.
+    The static system prompt is cached via prompt caching to reduce latency and
+    cost on repeated calls. Falls back to raw search snippets on timeout.
     """
-    prompt = _build_chat_prompt(question, results)
-    logger.info("Calling Glean Chat with %d document(s).", len(results))
+    user_content = _build_chat_prompt(question, results)
+    logger.info("Calling Claude API (claude-opus-4-7) with %d document(s).", len(results))
 
     try:
-        with _glean_client(timeout_ms=25000) as glean:
-            response = glean.client.chat.create(
-                messages=[{"fragments": [models.ChatMessageFragment(text=prompt)]}],
-                timeout_millis=25000,
-            )
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        with client.messages.stream(
+            model="claude-opus-4-7",
+            max_tokens=4096,
+            thinking={"type": "adaptive"},
+            system=[{
+                "type": "text",
+                "text": _CLAUDE_SYSTEM,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{"role": "user", "content": user_content}],
+        ) as stream:
+            message = stream.get_final_message()
 
-        messages = response.messages or []
-        if not messages:
-            return "No response received from Glean Chat."
-
-        last = messages[-1]
-        fragments = getattr(last, "fragments", []) or []
-        parts = [f.text for f in fragments if getattr(f, "text", None)]
-        answer = " ".join(parts).strip()
-        logger.info("Chat complete.")
+        answer = next((b.text for b in message.content if b.type == "text"), "").strip()
+        logger.info("Claude API complete.")
         return answer
 
     except Exception as e:
         if "timeout" in str(e).lower() or "timed out" in str(e).lower():
-            logger.warning("Glean Chat timed out — returning snippet fallback.")
+            logger.warning("Claude API timed out — returning snippet fallback.")
             return _snippets_fallback(question, results)
         raise
 
