@@ -59,9 +59,9 @@ def ask_lumina(
     """
     Ask the Lumina Stream Studios internal chatbot a natural-language question.
 
-    Internally this tool runs the full Glean pipeline:
+    Internally this tool runs the full Glean + Claude pipeline:
       1. Extracts keywords from the question and searches the Glean index.
-      2. Sends full document content to Glean Chat to generate a grounded answer.
+      2. Sends full document content to Claude (claude-opus-4-7) to generate a grounded answer.
 
     CRITICAL INSTRUCTIONS FOR CLAUDE: This tool returns a fully synthesized,
     grounded answer that already includes inline citations and a formatted Sources
